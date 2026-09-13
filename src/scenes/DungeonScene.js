@@ -9,6 +9,7 @@ import { getLocation, getQuest, QUESTS } from '../data/world.js';
 import { rollEnemyForTier, bossForTier, getEnemy } from '../data/enemies.js';
 import { getItem, rollDrop } from '../data/items.js';
 import { drawFigure, keyCap } from '../ui/widgets.js';
+import { renderCharPanel } from '../ui/charPanel.js';
 import { sfx } from '../core/audio.js';
 
 const TS = 40;
@@ -21,10 +22,12 @@ export class DungeonScene {
   constructor(game) {
     this.game = game;
     this.map = null;
+    this.showChar = false;   // 按 C 查看人物信息（打开时整张地图冻结）
     this._onBattleEnd = this._onBattleEnd.bind(this);
   }
 
   enter(args = {}) {
+    this.showChar = false;
     if (args.resume && this.map) {
       this.battleCooldown = 1.1;
       this.flash = { text: '归来', t: 0, color: PAL.jadeHi };
@@ -67,6 +70,9 @@ export class DungeonScene {
     this.stepT = 0;
     this.animT = 0;
     this.battleCooldown = 1.2;
+    // 剑意随一次秘境探索而生灭：踏进第一层即从零开始
+    // （回镇时已经清过，这里是双保险，防止日后新增入口时漏清）
+    if (this.floor === 1) this.game.player.intent = 0;
     this.reveal();
     this.cam = { x: 0, y: 0 };
     this.snapCam();
@@ -260,6 +266,15 @@ export class DungeonScene {
 
   // ---------------- 更新 ----------------
   update(dt) {
+    // 人物面板打开时整张地图冻结（包括巡逻的敌人），看信息不吃亏
+    if (this.showChar) {
+      if (justPressed('KeyC') || justPressed('KeyI') || justPressed('Escape')) {
+        this.showChar = false;
+        sfx.ui();
+      }
+      return;
+    }
+
     this.animT += dt;
     if (this.flash) {
       this.flash.t += dt;
@@ -272,6 +287,13 @@ export class DungeonScene {
     this.updateEnemies(dt);
     this.updateCam(dt);
     this.checkPickups();
+
+    // 随时可查人物信息（C / I）
+    if (justPressed('KeyC') || justPressed('KeyI')) {
+      this.showChar = true;
+      sfx.ui();
+      return;
+    }
 
     if (justPressed('Escape')) {
       this.game.toast('离开副本，进度不保。', PAL.crimsonHi);
@@ -632,6 +654,16 @@ export class DungeonScene {
     ctx.fillRect(0, 0, W, H);
 
     this.renderUI(ctx);
+    if (this.showChar) {
+      const P = this.game.player;
+      renderCharPanel(ctx, W, H, P, {
+        hp: P.hp, maxHp: P.maxHp,
+        qi: P.qi, maxQi: P.maxQi,
+        intent: P.intent, maxIntent: P.maxIntent,
+        showStam: false,      // 体力是战斗内资源，走图时没有意义
+        tip: '剑意随本次秘境探索而生灭，出秘境即散',
+      });
+    }
   }
 
   renderMap(ctx) {
@@ -863,13 +895,24 @@ export class DungeonScene {
       size: 10, align: 'center', baseline: 'middle', color: 'rgba(255,255,255,0.94)',
     });
 
+    // 剑意是秘境内的资源，走图时也要能看见攒到哪了
+    const intentR = clamp(P.intent / P.maxIntent, 0, 1);
+    const intentFull = P.intent >= P.maxIntent;
+    bar(ctx, 266, barY, barW, barH, intentR, '#c9a6ff', {
+      r: 3, flat: true,
+      border: intentFull ? 'rgba(233,214,255,0.95)' : 'rgba(0,0,0,0.55)',
+    });
+    text(ctx, `意 ${Math.floor(P.intent)}/${P.maxIntent}`, 266 + barW / 2, barY + barH / 2 + 0.5, {
+      size: 10, align: 'center', baseline: 'middle', color: 'rgba(255,255,255,0.94)',
+    });
+
     // 小地图
     this.renderMinimap(ctx);
 
     // 底部提示
     ctx.save();
     ctx.globalAlpha = 0.72;
-    const hint = 'WASD / 方向键 移动    ·    走到传送光门进入下一层    ·    Esc 撤离';
+    const hint = 'WASD / 方向键 移动    ·    走到传送光门进入下一层    ·    C 人物    ·    Esc 撤离';
     text(ctx, hint, W / 2, H - 16, { size: 12, align: 'center', color: PAL.paperDim });
     ctx.restore();
 

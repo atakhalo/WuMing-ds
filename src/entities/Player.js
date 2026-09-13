@@ -1,6 +1,6 @@
 // 玩家：属性、养成、存档
 
-import { BASE_MOVES, QI_MAX, STAM_MAX } from '../data/skills.js';
+import { BASE_MOVES, QI_MAX, STAM_MAX, INTENT } from '../data/skills.js';
 import { getWeapon, getArmor, forgeBonus } from '../data/items.js';
 import { expForLevel } from '../data/world.js';
 
@@ -39,6 +39,10 @@ export class Player {
     this.maxCombo = 0;
     this.bestFloor = 0;
 
+    // 剑意：只在一次秘境探索内保留。
+    // 回镇即清空（见 BaseScene.enter），故**不进存档**——刷新/重开都等于脱离了秘境
+    this.intent = 0;
+
     // 气血与内力是「当前值」，不进存档，但必须给出初值：
     // 缺了 qi 会让读 P.qi 的地方算出 NaN（副本 HUD 曾显示「气 NaN/55」）
     this.hp = this.maxHp;
@@ -59,6 +63,8 @@ export class Player {
   get maxStamina() {
     return STAM_MAX + this.attrs.agi * 1;
   }
+  get maxIntent() { return INTENT.max; }
+  get intentFull() { return this.intent >= INTENT.max; }
   get defense() {
     return this.armorData.def + this.weaponData.def + Math.floor(this.level * 0.4);
   }
@@ -160,6 +166,8 @@ export class Player {
     }
     this.attrs = Object.assign({ str: 0, vit: 0, agi: 0, int: 0 }, data.attrs || {});
     this.items = Object.assign({}, data.items || {});
+    // 剑意不进存档，读档一律归零（旧档里可能残留该字段，不能读进来）
+    this.intent = 0;
     this.hp = this.maxHp;
     this.qi = this.maxQi;
     return this;

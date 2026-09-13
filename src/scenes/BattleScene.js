@@ -30,10 +30,10 @@
 //     调整节奏、攒体力连招的窗口。
 
 import {
-  BASE_MOVES, SKILLS, ULTIMATE, SEQ_WINDOW, matchSkill,
+  BASE_MOVES, SKILLS, ULTIMATE, INTENT, SEQ_WINDOW, matchSkill, seqStep, stepMove, seqAfterSkill,
   QI_REGEN, STAM_REGEN, EVADE, GUARD, GUARD_PARRY_WINDOW, WAIT,
 } from '../data/skills.js';
-import { getEnemy, moveKind } from '../data/enemies.js';
+import { getEnemy, moveKind, SPAR_DUMMY, INTERVAL_SCALE } from '../data/enemies.js';
 import { getItem, rollDrop } from '../data/items.js';
 import {
   PAL, FONT, clamp, lerp, rand, randInt, fillRect, roundRectPath, text, bar,
@@ -41,6 +41,7 @@ import {
 } from '../core/utils.js';
 import { justPressed } from '../core/input.js';
 import { drawFigure } from '../ui/widgets.js';
+import { renderCharPanel } from '../ui/charPanel.js';
 import { sfx } from '../core/audio.js';
 
 const GROUND_Y = 402;
@@ -72,6 +73,7 @@ export class BattleScene {
     this.tip = null;
     this.result = null;
     this.rewardInfo = null;
+    this.showChar = false;   // 按 C 查看人物信息（打开时整个战斗冻结）
     this.hitStop = 0;
   }
 
@@ -79,10 +81,14 @@ export class BattleScene {
     this.reset();
     this.game.paused = false;
     this.training = !!args.training;
+    this.spar = !!args.spar;     // 演武：对手是「会还手的机关木人」，而不是死木桩
     this.theme = args.theme || { wall: '#2c2b26', floor: '#3a3630', accent: '#6f8f5c' };
     this.tier = args.tier || 1;
     this.onEnd = args.onEnd || null;
-    this.enemyDef = this.training ? DUMMY_ENEMY : getEnemy(args.enemyId);
+    // 演武场的两种木人：死桩（∞ 血、只挨打）与机关木人（血有限、会出手）
+    this.enemyDef = this.training
+      ? (this.spar ? SPAR_DUMMY : DUMMY_ENEMY)
+      : getEnemy(args.enemyId);
 
     // ---- 时间轴 ----
     // state: advancing 轴推进 | awaiting 轮到我方（冻结） | myPerform 我方演出（冻结） | enemyPerform 敌方演出（冻结）
@@ -96,6 +102,7 @@ export class BattleScene {
     this.enemyAt = 0;            // 敌人本次演出开始的时间轴时刻
     this.enemyBarFrom = 0;       // 敌方「过去的行动」那条的起点（最近一次出手时刻）
     this.enemyBarName = null;    // 该次出手的招式名
+    this.enemyBarKind = null;    // 该次出手的类型（defend 要在轴上换配色）
     this.enemyHasActed = false;  // 是否已经出手过至少一次
     this.enemyVs = null;         // 敌人出手时，我方正处于哪一段（决定闪避/格挡是否成立）
 
@@ -109,6 +116,9 @@ export class BattleScene {
       qi: this.training ? P.maxQi : clamp(P.qi == null ? P.maxQi : P.qi, 0, P.maxQi),
       maxStam: P.maxStamina,
       stam: P.maxStamina,
+      // 剑意是跨战斗资源：进场沿用存档值，演武场照常带入（能不能攒见 gainIntent）
+      maxIntent: INTENT.max,
+      intent: clamp(P.intent == null ? 0 : P.intent, 0, INTENT.max),
       x: P_X,
       lunge: 0,
       facing: 1,
@@ -136,7 +146,9 @@ export class BattleScene {
       facing: -1,
       hitQueue: [],
       hitFlash: 0,
-      guarding: false,      // 正在防御（玩家伤害被削弱）
+      // 防御是一段「轴上的窗口」而不是演出状态：从它出手那一刻起盖到下一次出手。
+      // 演出不入轴、玩家也不可能在演出里出招，所以减伤必须挂在轴上才可能被撞上
+      guardUntil: -Infinity,   // 窗口的截止时刻（绝对时刻）
       guardMul: 1,
       restHeal: 0,
       dead: false,
@@ -149,7 +161,8 @@ export class BattleScene {
     this.phaseTimer = 1.15;
     this.introT = 0;
 
-    this.ensureEnemyQueue(4, rand(0.5, 1.0));
+    // 开局第一击提前：开场就要面对出手，没有白打的空档
+    this.ensureEnemyQueue(4, rand(0.28, 0.55));
   }
 
   get P() { return this.game.player; }
@@ -173,9 +186,7 @@ export class BattleScene {
 
   enemyInterval() {
     const iv = this.e.def.interval || [2, 3];
-    // interval 原意是两次出手的间隔，但现在的模型里「表演」已单独占用一段
-    // 真实时间，故只取其中一部分作为轴上间隔
-    return rand(iv[0], iv[1]) * 0.42;
+    return rand(iv[0], iv[1]) * INTERVAL_SCALE;
   }
 
   /** 预先排定若干次敌人行动，队列排满为止（供轴上显示未来的行动） */
@@ -233,6 +244,7 @@ export class BattleScene {
     // 表演期间轴上依然在，不会消失
     this.enemyBarFrom = plan.at;
     this.enemyBarName = plan.move.name;
+    this.enemyBarKind = plan.kind;
     this.enemyHasActed = true;
     // 立刻把队列补回两条：否则表演期间队列只剩一条，
     // 轴上「将要的行动」那条会整段消失，演完才重新出现
@@ -264,9 +276,12 @@ export class BattleScene {
     }
     // defend 无结算，纯粹是一段「玩家打不痛」的窗口
 
-    // 防御期间玩家的伤害被削弱
-    this.e.guarding = plan.kind === 'defend';
-    this.e.guardMul = mv.guardMul == null ? 0.4 : mv.guardMul;
+    // 防御窗口 = [它出手那一刻, 它下一次出手)。轴上的「过去的行动」那条画的就是这一段，
+    // 窗口与它严格一致，玩家看条就知道这段时间硬拼不划算。
+    if (plan.kind === 'defend') {
+      this.e.guardUntil = this.enemyQueue.length ? this.enemyQueue[0].at : plan.at + 0.8;
+      this.e.guardMul = mv.guardMul == null ? 0.4 : mv.guardMul;
+    }
 
     this.state = 'enemyPerform';
     this.e.swing = 0;
@@ -277,7 +292,6 @@ export class BattleScene {
     const perf = this.enemyPerf;
     const e = this.e;
     e.swing = 0;
-    e.guarding = false;
     e.hitQueue.length = 0;
     this.enemyPerf = null;
     this.enemyVs = null;
@@ -288,6 +302,16 @@ export class BattleScene {
 
   // ==================== 更新 ====================
   update(dt) {
+    // 人物信息面板打开时整个战斗冻结：时间轴、演出、资源、特效一概不推进，
+    // 否则玩家看信息时会被继续推进的敌人打死
+    if (this.showChar) {
+      if (justPressed('KeyC') || justPressed('KeyI') || justPressed('Escape')) {
+        this.showChar = false;
+        sfx.ui();
+      }
+      return;
+    }
+
     if (this.hitStop > 0) {
       this.hitStop -= dt;
       dt *= 0.15;
@@ -463,6 +487,13 @@ export class BattleScene {
 
     if (justPressed('Escape')) { this.tryFlee(); return; }
 
+    // 随时可查人物信息（C / I），不占用行动、不影响时间轴
+    if (justPressed('KeyC') || justPressed('KeyI')) {
+      this.showChar = true;
+      sfx.ui();
+      return;
+    }
+
     // 只有轮到我方时才接受指令；此后一切交给时间轴
     if (awaiting) {
       if (justPressed('KeyJ')) { this.tryMove('light'); return; }
@@ -482,14 +513,14 @@ export class BattleScene {
     const p = this.p;
     if (this.state !== 'awaiting') return;
 
-    const seq = p.seq.concat([moveId]);
+    const seq = p.seq.concat([seqStep(moveId)]);
     const skill = matchSkill(seq);
 
     if (skill && this.P.hasSkill(skill.id)) {
       if (p.qi >= skill.qi) { this.castSkill(skill); return; }
       this.flashTip(`内力不足，连招中断（需 ${skill.qi}）`);
       sfx.fail();
-      this.baseMove(moveId, [moveId]);
+      this.baseMove(moveId, [seqStep(moveId)]);
       return;
     }
     this.baseMove(moveId, seq);
@@ -538,6 +569,7 @@ export class BattleScene {
     p.stam -= mv.stamina;
     p.seq = seq.slice();
     p.seqSetAt = this.now;
+    this.gainIntent(INTENT.perBase);
 
     this.beginMyAction({
       kind: 'attack',
@@ -570,8 +602,11 @@ export class BattleScene {
   castSkill(skill) {
     const p = this.p;
     p.qi -= skill.qi;
-    p.seq = [];
-    p.seqSetAt = -999;
+    // 原序列清空；若这招本身相当于一个基础招式（风卷残云算「轻」、白虹贯日算「重」），
+    // 就作为一项接进新序列，让连招能一路滚下去（轻轻轻→风卷残云→再按两下轻→…）
+    p.seq = seqAfterSkill(skill);
+    p.seqSetAt = p.seq.length ? this.now : -999;
+    this.gainIntent(INTENT.perSkill);
 
     const per = skill.steps.length ? this.skillWeaponBonus / skill.steps.length : 0;
     this.beginMyAction({
@@ -589,16 +624,31 @@ export class BattleScene {
     sfx.skill();
   }
 
+  /**
+   * 剑意累积：出招（基础招与连招）都会长剑意，攒满才能放绝学。
+   * 生命周期是「一次秘境探索」：场内（含演武）随便攒，离开秘境或演武结束就归零。
+   */
+  gainIntent(n) {
+    const p = this.p;
+    if (n <= 0 || p.intent >= p.maxIntent) return;
+    p.intent = Math.min(p.maxIntent, p.intent + n);
+    if (p.intent >= p.maxIntent) {
+      this.flashTip('剑意已满 · 按 U 出无明剑意');
+      sfx.parry();
+    }
+  }
+
   doUltimate() {
     const p = this.p;
     if (this.state !== 'awaiting') return;
-    if (p.qi < ULTIMATE.minQi) {
-      this.flashTip(`内力不足（需 ${ULTIMATE.minQi}）`);
+    if (p.intent < ULTIMATE.intentCost) {
+      this.flashTip(`剑意未满（${Math.floor(p.intent)} / ${ULTIMATE.intentCost}）`);
       sfx.fail();
       return;
     }
-    const spent = p.qi;
-    p.qi = 0;
+    // 伤害由剑意换算而来（不与内力挂钩），放完清零
+    const spent = p.intent;
+    p.intent = 0;
     p.seq = [];
     p.seqSetAt = -999;
 
@@ -611,7 +661,7 @@ export class BattleScene {
       steps: [{
         delay: ULTIMATE.delay,
         step: {
-          dmg: spent * ULTIMATE.perQi * this.P.attackMul,
+          dmg: spent * ULTIMATE.dmgPerIntent * this.P.attackMul,
           reach: ULTIMATE.reach, arc: 240, fx: 'ultimate',
           tint: ULTIMATE.tint,
           pierce: true, breakGuard: true, knockback: 70, screenShake: 16,
@@ -652,6 +702,10 @@ export class BattleScene {
     if (this.state !== 'awaiting') return;
     if (p.stam < GUARD.stamina) { this.flashTip('体力不济，可先「让招」(S) 回气'); sfx.fail(); return; }
     p.stam -= GUARD.stamina;
+    // 格挡打断连招：举剑架招，先前攒下的序列就此作废（不额外提示，看序列即可）
+    p.seq = [];
+    p.seqSetAt = -999;
+    this.flashTip('格挡');
     this.beginMyAction({
       kind: 'guard',
       perform: GUARD.perform,
@@ -665,6 +719,10 @@ export class BattleScene {
   /** 让招：不出招，只把时间轴往前放一段，用来调整出手节奏（不耗体，总是可用） */
   doWait() {
     if (this.state !== 'awaiting') return;
+    const p = this.p;
+    // 与格挡一样打断连招：收手让招，先前攒下的序列就此作废（不额外提示，看序列即可）
+    p.seq = [];
+    p.seqSetAt = -999;
     this.flashTip('让招 · 静观其变');
     this.beginMyAction({
       kind: 'wait',
@@ -709,7 +767,16 @@ export class BattleScene {
     const e = this.e;
     if (e.dead) return;
 
-    if (this.training) {
+    // 命中回气：基础招式按招式表，连招每段固定 3 点。
+    // 放在演武场分支之前——否则打木人桩不回气，就没法在那里练连招。
+    if (st.isBase && st.qiGain) {
+      p.qi = Math.min(p.maxQi, p.qi + st.qiGain);
+    } else if (!st.isBase) {
+      p.qi = Math.min(p.maxQi, p.qi + 3);
+    }
+
+    // 死木桩只是挨打的靶子：伤害取简化数值、不扣血。机关木人走正常结算，能被打空
+    if (this.training && e.def.dummy) {
       this.spawnFloater(e.x, GROUND_Y - 96, Math.round(st.dmg), '#ffffff', 17);
       this.bumpCombo();
       this.spawnHit(e.x, GROUND_Y - 50, st.tint, 0.7);
@@ -720,8 +787,8 @@ export class BattleScene {
 
     const pierce = st.pierce ? 0.5 : 1;
     let real = Math.max(1, st.dmg - e.def.def * 0.6 * pierce);
-    // 敌人正在防御：伤害被大幅削弱，这是它「歇一口气」的窗口
-    if (e.guarding) {
+    // 敌人正在防御（轴上的那段窗口内）：伤害被大幅削弱，这是它「歇一口气」的时间
+    if (this.now < e.guardUntil) {
       real *= e.guardMul;
       this.spawnFloater(e.x + rand(-10, 10), GROUND_Y - 118, '挡', '#a9b4c0', 17);
     }
@@ -730,8 +797,9 @@ export class BattleScene {
     this.bumpCombo();
 
     const big = real > 26;
+    // 只写伤害数值：连击数改用「N 连」跟在后面，避免被误读成伤害倍率
     this.spawnFloater(e.x + rand(-8, 8), GROUND_Y - 96 - rand(0, 12),
-      Math.round(real) + (p.combo > 4 ? ` x${p.combo}` : ''),
+      `${Math.round(real)}${p.combo > 4 ? `　${p.combo} 连` : ''}`,
       big ? '#ffcf5c' : '#ffffff', big ? 22 : 17);
     this.spawnHit(e.x, GROUND_Y - 50, st.tint, big ? 1.35 : 0.85);
     this.shake(big ? 7 : 3, big ? 0.2 : 0.11);
@@ -750,12 +818,6 @@ export class BattleScene {
       this.state = 'advancing';
     }
     if (st.screenShake) this.shake(st.screenShake, 0.35);
-
-    if (st.isBase && st.qiGain) {
-      p.qi = Math.min(p.maxQi, p.qi + st.qiGain);
-    } else if (!st.isBase) {
-      p.qi = Math.min(p.maxQi, p.qi + 3);
-    }
 
     if (e.hp <= 0) this.killEnemy();
   }
@@ -814,6 +876,8 @@ export class BattleScene {
     sfx.hurt();
     if (p.hp <= 0) {
       p.hp = 0;
+      // 演武场里被打空不算败：不记死亡、不丢进度，只收场
+      if (this.training) { this.flashTip('气血耗尽 · 演武收场'); this.endBattle('flee'); return; }
       this.endBattle('defeat');
     }
   }
@@ -823,6 +887,7 @@ export class BattleScene {
     e.hp = 0;
     e.dead = true;
     e.hitQueue.length = 0;
+    e.guardUntil = -Infinity;
     this.enemyPerf = null;
     this.enemyQueue.length = 0;
     sfx.die();
@@ -875,9 +940,13 @@ export class BattleScene {
     if (!this.training) {
       P.hp = clamp(this.p.hp, 1, P.maxHp);
       P.qi = this.p.qi;
+      // 剑意在同一次秘境探索的战斗之间保留，带回副本场景
+      P.intent = clamp(this.p.intent, 0, P.maxIntent);
     } else {
       P.hp = P.maxHp;
       P.qi = P.maxQi;
+      // 演武攒下的剑意不带出去（秘境外一律为零）
+      P.intent = 0;
     }
     this.game.save();
     const cb = this.onEnd;
@@ -948,8 +1017,24 @@ export class BattleScene {
 
   // ==================== 渲染 ====================
   render(ctx) {
-    const t = this.theme;
+    this.renderWorld(ctx);
+    this.renderOverlay(ctx);
+    // 人物面板永远画在最上层
+    if (this.showChar) {
+      renderCharPanel(ctx, this.game.W, this.game.H, this.P, {
+        hp: this.p.hp, maxHp: this.p.maxHp,
+        qi: this.p.qi, maxQi: this.p.maxQi,
+        stam: this.p.stam, maxStam: this.p.maxStam,
+        intent: this.p.intent, maxIntent: this.p.maxIntent,
+        tip: this.p.intent >= this.p.maxIntent ? '剑意已满 —— 按 U 出「无明剑意」'
+          : this.training ? '演武中攒下的剑意，一出演武场即散'
+            : '剑意随本次秘境探索而生灭，出秘境即散',
+      });
+    }
+  }
 
+  renderWorld(ctx) {
+    const t = this.theme;
     const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
     g.addColorStop(0, '#12100e');
     g.addColorStop(0.55, t.wall || '#2c2b26');
@@ -996,8 +1081,6 @@ export class BattleScene {
       ctx.fillStyle = vg;
       ctx.fillRect(0, 0, this.game.W, this.game.H);
     }
-
-    this.renderOverlay(ctx);
   }
 
   renderBackdrop(ctx) {
@@ -1122,11 +1205,13 @@ export class BattleScene {
     });
     ctx.restore();
 
-    // 敌人演出中的提示：攻击给红色起手警示，防御/歇息给柔和标示
+    // 敌人演出中的提示：攻击给红色起手警示，防御/歇息给柔和标示。
+    // 防御的标示要盖满轴上的整段（不只表演那一下），玩家才知道何时不该硬拼
     const perf = this.enemyPerf;
-    if (perf && !e.dead && this.phase === 'fight') {
+    const guarding = this.now < e.guardUntil;
+    if ((perf || guarding) && !e.dead && this.phase === 'fight') {
       const bob = Math.sin(this.game.time * 18) * 3;
-      if (perf.kind === 'attack') {
+      if (perf && perf.kind === 'attack') {
         if (perf.t < perf.strikeAt) {
           const k = clamp(perf.t / Math.max(0.01, perf.strikeAt), 0, 1);
           ctx.save();
@@ -1147,7 +1232,7 @@ export class BattleScene {
         }
       } else {
         // 防御 / 歇息：提示这是可以调整节奏的窗口
-        const isGuard = perf.kind === 'defend';
+        const isGuard = guarding;
         const col = isGuard ? '#a9b4c0' : '#7ce08a';
         ctx.save();
         ctx.globalAlpha = 0.4;
@@ -1298,7 +1383,9 @@ export class BattleScene {
       size: boss ? 20 : 17, color: boss ? '#e05c4a' : PAL.paper, outline: 3,
     });
 
-    const hpRatio = this.training ? 1 : clamp(e.hp / e.maxHp, 0, 1);
+    // 只有死木桩显示 ∞：机关木人的血是有限的，打空即收场
+    const infiniteHp = this.training && e.def.dummy;
+    const hpRatio = infiniteHp ? 1 : clamp(e.hp / e.maxHp, 0, 1);
     ctx.fillStyle = 'rgba(0,0,0,0.62)';
     ctx.fillRect(bx - 2, by - 2, bw + 4, 14);
     const hg = ctx.createLinearGradient(bx, by, bx, by + 10);
@@ -1310,7 +1397,7 @@ export class BattleScene {
     ctx.lineWidth = 1;
     ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, 9);
 
-    text(ctx, this.training ? '∞' : `${Math.ceil(e.hp)} / ${e.maxHp}`, bx + bw / 2, by + 5, {
+    text(ctx, infiniteHp ? '∞' : `${Math.ceil(e.hp)} / ${e.maxHp}`, bx + bw / 2, by + 5, {
       size: 11, align: 'center', baseline: 'middle', color: '#fff',
     });
     if (!this.training) {
@@ -1373,16 +1460,37 @@ export class BattleScene {
       size: 9.5, align: 'center', baseline: 'middle', color: 'rgba(255,255,255,0.92)',
     });
 
+    // 剑意：攒满才能按 U 出无明剑意，所以满了要显眼
+    const full = p.intent >= p.maxIntent;
+    const pulse = full ? 0.72 + Math.sin(this.game.time * 7) * 0.28 : 1;
+    ctx.save();
+    ctx.globalAlpha = pulse;
+    bar(ctx, x + 14, y + 76, barW, 10, p.intent / p.maxIntent, ULTIMATE.tint, {
+      r: 2,
+      border: full ? 'rgba(233,214,255,0.95)' : 'rgba(0,0,0,0.55)',
+    });
+    ctx.restore();
+    text(ctx, full ? `剑意已满 · ${Math.floor(p.intent)}（按 U）` : `剑意 ${Math.floor(p.intent)} / ${p.maxIntent}`,
+      x + 14 + barW / 2, y + 81, {
+        size: 9.5, align: 'center', baseline: 'middle',
+        color: full ? '#1a1220' : 'rgba(255,255,255,0.92)',
+        weight: full ? 700 : 400,
+      });
+
     const jin = this.P.itemCount('jinchuang');
     const xing = this.P.itemCount('xingqi');
-    text(ctx, `[1] 药 ×${jin}`, x + 14, y + 88, { size: 11, color: jin > 0 ? PAL.jadeHi : '#584f40' });
-    text(ctx, `[2] 散 ×${xing}`, x + 92, y + 88, { size: 11, color: xing > 0 ? PAL.azure : '#584f40' });
+    text(ctx, `[1] 药 ×${jin}`, x + 14, y + 100, { size: 11, color: jin > 0 ? PAL.jadeHi : '#584f40' });
+    text(ctx, `[2] 散 ×${xing}`, x + 92, y + 100, { size: 11, color: xing > 0 ? PAL.azure : '#584f40' });
+    // 让人知道战斗中随时能查人物（打开时战斗冻结，看信息不吃亏）
+    text(ctx, '[C] 人物', x + w - 14, y + 100, {
+      size: 11, align: 'right', color: PAL.paperFaint,
+    });
 
     if (p.combo > 1) {
       const k = clamp((this.now - p.comboSetAt) / 2.4, 0, 1);
       ctx.save();
       ctx.globalAlpha = 0.5 + (1 - k) * 0.5;
-      strokeText(ctx, `${p.combo} 连`, x + w - 40, y + 92, {
+      strokeText(ctx, `${p.combo} 连`, x + w - 40, y + 110, {
         size: 19, color: p.combo > 9 ? '#ffcf5c' : '#e9dfe8', outline: 3,
       });
       ctx.restore();
@@ -1414,20 +1522,26 @@ export class BattleScene {
     if (p.seq.length === 0) {
       text(ctx, '—', x + 4, y + 54, { size: 18, color: '#4d4638' });
     } else {
-      p.seq.forEach((m, i) => {
-        const isHeavy = m === 'heavy';
+      p.seq.forEach((step, i) => {
+        const isHeavy = stepMove(step) === 'heavy';
+        // 由招式接续而来的那一项：写招式名而不是「轻/重」，底部色条标出它算哪一类
+        const sk = step.via ? SKILLS.find((s) => s.id === step.via) : null;
         const bx = x + i * (NS + gap);
         const by = y + 34;
         roundRectPath(ctx, bx, by, NS, NS, 4);
         ctx.fillStyle = isHeavy ? 'rgba(80,58,20,0.92)' : 'rgba(40,36,28,0.92)';
         ctx.fill();
-        ctx.strokeStyle = isHeavy ? PAL.gold : PAL.paper;
-        ctx.lineWidth = isHeavy ? 2 : 1.4;
+        ctx.strokeStyle = sk ? sk.tint : isHeavy ? PAL.gold : PAL.paper;
+        ctx.lineWidth = isHeavy || sk ? 2 : 1.4;
         ctx.stroke();
-        text(ctx, isHeavy ? '重' : '轻', bx + NS / 2, by + NS / 2 + 1, {
-          size: 13, weight: 700, align: 'center', baseline: 'middle',
-          color: isHeavy ? PAL.gold : PAL.paper,
+        const label = sk ? sk.name.slice(0, 2) : isHeavy ? '重' : '轻';
+        let size = 13;
+        while (size > 9 && measure(ctx, label, size, 700) > NS - 4) size--;
+        text(ctx, label, bx + NS / 2, by + NS / 2 + (sk ? 0 : 1), {
+          size, weight: 700, align: 'center', baseline: 'middle',
+          color: sk ? sk.tint : isHeavy ? PAL.gold : PAL.paper,
         });
+        if (sk) fillRect(ctx, bx + 3, by + NS - 4, NS - 6, 2, isHeavy ? PAL.gold : PAL.paper);
       });
       const life = clamp(1 - (this.now - p.seqSetAt) / SEQ_WINDOW, 0, 1);
       fillRect(ctx, x, y + 66, w - 22, 2, 'rgba(255,255,255,0.08)');
@@ -1446,7 +1560,7 @@ export class BattleScene {
       const sk = SKILLS.find((s) => s.id === sid);
       if (!sk || sk.pattern.length <= seq.length) continue;
       let pre = true;
-      for (let i = 0; i < seq.length; i++) if (sk.pattern[i] !== seq[i]) { pre = false; break; }
+      for (let i = 0; i < seq.length; i++) if (sk.pattern[i] !== stepMove(seq[i])) { pre = false; break; }
       if (pre) next.push({ sk, need: sk.pattern.slice(seq.length) });
     }
     if (!next.length) return seq.length ? { text: '无后续招式', color: '#584f40' } : null;
@@ -1526,20 +1640,25 @@ export class BattleScene {
 
     const eQ = this.enemyQueue;
 
-    const enemySeg = (from, to, name, isPast) => {
+    // 防御段单独配色：它代表「这段时间打它不痛」，与普通攻击段区分开
+    const enemySeg = (from, to, name, isPast, kind) => {
       const l = Math.max(toPx(from), trackL);
       const r = Math.min(toPx(to), trackR);
       if (r - l <= 1) return;
 
+      const defend = kind === 'defend';
+      const fillCol = defend ? '#5a6a78' : '#b0453a';
+      const lineCol = defend ? '#a9b4c0' : '#e05c4a';
+
       roundRectPath(ctx, l, eBarY, r - l, barH, 3);
-      ctx.fillStyle = isPast ? this.hexA('#b0453a', 0.15) : this.hexA('#b0453a', 0.30);
+      ctx.fillStyle = this.hexA(fillCol, isPast ? 0.15 : 0.30);
       ctx.fill();
-      ctx.strokeStyle = isPast ? this.hexA('#e05c4a', 0.34) : this.hexA('#e05c4a', 0.58);
+      ctx.strokeStyle = this.hexA(lineCol, isPast ? 0.34 : 0.58);
       ctx.lineWidth = 1;
       ctx.stroke();
 
       // 两端各标一次「出手时刻」
-      ctx.fillStyle = this.hexA('#ff8566', isPast ? 0.48 : 0.95);
+      ctx.fillStyle = this.hexA(defend ? '#c8d4dc' : '#ff8566', isPast ? 0.48 : 0.95);
       const sl = Math.max(toPx(from), trackL);
       const sr = Math.min(toPx(from) + 4, trackR);
       if (sr > sl) ctx.fillRect(sl, eBarY, sr - sl, barH);
@@ -1547,8 +1666,10 @@ export class BattleScene {
       if (er >= trackL && er <= trackR) ctx.fillRect(er - 2, eBarY, 4, barH);
 
       const dur = to - from;
-      const label = `${name || '行动'} ${dur.toFixed(1)}s`;
-      const tcol = isPast ? 'rgba(255,186,166,0.62)' : 'rgba(255,208,196,0.92)';
+      const label = `${defend ? '守 · ' : ''}${name || '行动'} ${dur.toFixed(1)}s`;
+      const tcol = defend
+        ? (isPast ? 'rgba(190,206,218,0.62)' : 'rgba(212,226,236,0.94)')
+        : (isPast ? 'rgba(255,186,166,0.62)' : 'rgba(255,208,196,0.92)');
       if (r - l > measure(ctx, label, 10.5, 700) + 10) {
         text(ctx, label, (l + r) / 2, eBarY + barH / 2, {
           size: 10.5, weight: 700, align: 'center', baseline: 'middle', color: tcol,
@@ -1563,11 +1684,11 @@ export class BattleScene {
     if (!this.e.dead) {
       // 过去的行动：最近一次已发生的出手，从它出手那一刻起算它的 cd
       if (this.enemyHasActed && eQ.length) {
-        enemySeg(this.enemyBarFrom, eQ[0].at, this.enemyBarName, true);
+        enemySeg(this.enemyBarFrom, eQ[0].at, this.enemyBarName, true, this.enemyBarKind);
       }
       // 将要的行动：队列里的下一次出手，同样从它出手那一刻起算它的 cd
       if (eQ.length >= 2) {
-        enemySeg(eQ[0].at, eQ[1].at, eQ[0].move.name, false);
+        enemySeg(eQ[0].at, eQ[1].at, eQ[0].move.name, false, eQ[0].kind);
       }
     }
 
@@ -1628,26 +1749,31 @@ export class BattleScene {
     // ---- 我方候选：下箭头标出「选它的话，时间会推进到哪一刻」----
     if (awaiting) {
       const spd = this.P.speedMul;
+      // 候选分两排：防御（闪避／格挡）在上、基础招式（轻／重）在下。
+      // 同排两项的落点天然隔得开（闪避 0.30 vs 格挡 0.50、轻 0.36 vs 重 0.60），
+      // 两排正好把四个标签装下；若因轴段或缩放改动挤住，会顺延到下一排兜底，不至于叠字
       const items = [
-        { name: '轻', axis: BASE_MOVES.light.cd, cost: BASE_MOVES.light.stamina, tint: '#e9dfc8' },
-        { name: '重', axis: BASE_MOVES.heavy.cd, cost: BASE_MOVES.heavy.stamina, tint: '#d4a24c' },
-        { name: '闪避', axis: EVADE.axis, cost: EVADE.stamina, tint: EVADE.tint },
-        { name: '格挡', axis: GUARD.axis, cost: GUARD.stamina, tint: GUARD.tint },
+        { name: '轻', axis: BASE_MOVES.light.cd, cost: BASE_MOVES.light.stamina, tint: '#e9dfc8', row: 0 },
+        { name: '重', axis: BASE_MOVES.heavy.cd, cost: BASE_MOVES.heavy.stamina, tint: '#d4a24c', row: 0 },
+        { name: '闪避', axis: EVADE.axis, cost: EVADE.stamina, tint: EVADE.tint, row: 1 },
+        { name: '格挡', axis: GUARD.axis, cost: GUARD.stamina, tint: GUARD.tint, row: 1 },
       ].map((it) => ({ ...it, x: x0 + it.axis * spd * scale }));
 
-      // 位置接近的标记错开行，避免文字互相压住
-      const sorted = items.slice().sort((a, b) => a.x - b.x);
-      const rowEnds = [];
-      for (const it of sorted) {
-        const wNeed = measure(ctx, it.name, 10.5, 700) + 10;
-        let row = 0;
-        while (row < rowEnds.length && it.x - wNeed / 2 < rowEnds[row]) row++;
-        if (row >= rowEnds.length) rowEnds.push(0);
-        rowEnds[row] = it.x + wNeed / 2;
+      // 同排两项的最小留白。身法越高同排间距越窄（轴段差 × spd × scale），留白取小些
+      const LABEL_GAP = 3;
+      const rowEnds = [-Infinity, -Infinity];
+      const order = items.slice().sort((a, b) => (a.row - b.row) || (a.x - b.x));
+      for (const it of order) {
+        const half = measure(ctx, it.name, 10.5, 700) / 2;
+        let row = it.row;
+        while (row < rowEnds.length && it.x - half < rowEnds[row] + LABEL_GAP) row++;
+        if (row >= rowEnds.length) rowEnds.push(-Infinity);
+        rowEnds[row] = it.x + half;
         it.row = row;
       }
 
-      const rowHgt = 12;
+      // 排距取 15：字号 10.5 时两排之间留出约 4.5px 空隙，再小就贴在一起了
+      const rowHgt = 15;
       const baseY = axisY - 7;
       for (const it of items) {
         const ok = p.stam >= it.cost;
@@ -1659,9 +1785,10 @@ export class BattleScene {
           color: ok ? 'rgba(233,223,200,0.9)' : 'rgba(190,130,120,0.7)',
         });
 
-        // 下箭头：从标签下方指向轴上的时刻
+        // 下箭头：从标签下方穿过时间轴**与我方整条行动条**，尖端落在两方行动条之间——
+        // 竖线所在就是落点，不必在两条之间来回对位
         const top = labelY + 2;
-        const bot = axisY - 1;
+        const bot = (myBarY + barH + eBarY) / 2;
         if (bot > top) {
           ctx.save();
           ctx.strokeStyle = col;
@@ -1777,7 +1904,7 @@ export class BattleScene {
         size: 13, align: 'center', color: '#8a6a2f',
       });
     } else if (this.phase === 'flee') {
-      text(ctx, '你退出了战斗。', W / 2, H / 2 - 10, {
+      text(ctx, this.training ? '演武到此为止，回镇调息。' : '你退出了战斗。', W / 2, H / 2 - 10, {
         size: 14, align: 'center', color: PAL.paperDim,
       });
     }

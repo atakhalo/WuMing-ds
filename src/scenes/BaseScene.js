@@ -36,6 +36,8 @@ export class BaseScene {
     // 回镇休整：气血与内力一并回满（内力在战斗之间是继承的）
     P.hp = P.maxHp;
     P.qi = P.maxQi;
+    // 剑意只在一次秘境探索内保留：回镇即脱离秘境，一并清空
+    P.intent = 0;
     this.mode = 'walk';
     this.panel = null;
     this.charPanel = null;
@@ -197,6 +199,12 @@ export class BaseScene {
         action: () => this.startTrial(),
       },
       {
+        label: '演武 · 机关木人',
+        desc: '会还手的木人。起手、收招都真，用来练读轴——闪避、格挡、招架都得在这里试。',
+        value: '进入',
+        action: () => this.startSpar(),
+      },
+      {
         label: '重述要诀',
         desc: '轻重 J/K 出招；L 闪避、空格格挡、S 让招——都是排进时间轴的一段行动。',
         value: '',
@@ -217,6 +225,21 @@ export class BaseScene {
     this.panel = null;
     this.game.goto('battle', {
       training: true,
+      theme: { wall: '#2b2822', floor: '#3a352c', accent: '#6f8f5c' },
+      onEnd: () => {
+        this.game.toast('演武结束', PAL.paperDim);
+        this.game.goto('base');
+      },
+    });
+  }
+
+  /** 机关木人：会还手的陪练。仍是演武——不计死亡、不给奖励 */
+  startSpar() {
+    this.mode = 'walk';
+    this.panel = null;
+    this.game.goto('battle', {
+      training: true,
+      spar: true,
       theme: { wall: '#2b2822', floor: '#3a352c', accent: '#6f8f5c' },
       onEnd: () => {
         this.game.toast('演武结束', PAL.paperDim);
@@ -284,7 +307,8 @@ export class BaseScene {
       const afford = P.gold >= s.price;
       items.push({
         label: s.name,
-        desc: `${s.pattern.map((m) => (m === 'light' ? '轻' : '重')).join('·')}　耗气 ${s.qi}　${s.desc}`,
+        desc: `${s.pattern.map((m) => (m === 'light' ? '轻' : '重')).join('·')}　耗气 ${s.qi}　${s.desc}`
+          + (s.as ? `　出招后可当「${s.as === 'light' ? '轻' : '重'}」续接下一招` : ''),
         value: known ? '已习' : s.price === 0 ? '本就通晓' : `${s.price} 两`,
         tag: known ? `总伤 ${Math.round(skillTotalDamage(s))}` : '',
         disabled: known || !afford,
@@ -855,6 +879,8 @@ export class BaseScene {
       text(ctx, k, x, y, { size: 12, color: '#8b8069' });
       text(ctx, String(v), x + 130, y, { size: 12, align: 'right', color: PAL.paper });
     });
+    // 剑意只在秘境里积攒，回镇必为 0——这里只说清规则，不显示数字
+    text(ctx, '剑意于秘境中积攒，出秘境即散', px + 30, py + 372, { size: 11, color: '#6d6350' });
 
     // 右：装备与剑招
     sectionTitle(ctx, px + 364, py + 74, '行装');
@@ -887,9 +913,13 @@ export class BaseScene {
       text(ctx, `耗气 ${s.qi}`, px + 632, y, { size: 11, align: 'right', color: PAL.paperFaint });
       text(ctx, `${s.steps.length} 段 · 总伤 ${Math.round(skillTotalDamage(s))}`,
         px + 372, y + 11, { size: 10.5, color: '#8a8070' });
+      if (s.as) {
+        text(ctx, `接续 ${s.as === 'light' ? '轻' : '重'}`, px + 632, y + 11,
+          { size: 10.5, align: 'right', color: baseTint(s.tint) });
+      }
     });
 
-    text(ctx, '绝学：无明剑意　按 U　消耗全部内力（需 ≥40）',
+    text(ctx, '绝学：无明剑意　按 U　需剑意攒满（出招累积，跨战斗保留）',
       px + 372, py + ph - 24, { size: 11, color: '#8a6a2f' });
     text(ctx, '战斗为时间轴制：轮到你时冻结选行动，表演不入轴，只有 cd 段推进时间',
       px + 372, py + ph - 10, { size: 10.5, color: '#6d6350' });

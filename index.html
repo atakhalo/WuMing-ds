@@ -310,6 +310,15 @@ __def("src/data/skills.js", [], function () {
 // 【搓招规则】基础招式（轻/重）按下即出招，并记入连招序列。
 // 每次出招后检查序列末尾是否完整匹配某个技能，匹配则清空整个序列并释放技能。
 //
+// 【接续规则】某些招式使完之后本身就相当于一个基础招式（见 SKILLS 的 as 字段）：
+//   · 风卷残云 → 可当作「轻」
+//   · 白虹贯日 → 可当作「重」
+// 释放这类招式时，原序列照旧清空，但该招式会作为**一项**接进新序列，
+// 于是「轻轻轻(风卷残云) → 轻轻轻」能再滚出一段风卷残云，连招可以一路接下去。
+// 序列项统一用 seqStep() 构造：{ move: 'light'|'heavy', via: 招式id|null }，
+// 匹配时只看等效基础招式（stepMove），via 只用于显示。
+// 格挡与让招会**打断连招**（序列作废）——举剑架招、收手让招时都顾不上续招；闪避不影响序列。
+//
 // 【节奏规则】战斗由单一时间轴驱动，且**表现与时间轴是分开的**：
 //   · perform  出招演出时长。演出期间时间轴**冻结**，只有画面在动。
 //   · cd       演出结束后该行动在时间轴上占用的时长，期间时间轴推进。
@@ -367,18 +376,23 @@ const QI_REGEN = 1.2;           // 每秒自然回气
 // 演出（perform）期间时间轴暂停，随后在轴上占用 axis 时长。
 // 若敌方行动点落在这段之内，即判定为成功闪避 / 格挡——无需即时反应。
 // 代价：这两段之内**不回体力**，所以不能靠连续防御无限拖。
-const EVADE = { perform: 0.18, axis: 0.50, stamina: 20, tint: '#8fd0e8' };
-const GUARD = { perform: 0.16, axis: 1.00, stamina: 20, tint: '#c8c0a8' };
+// 轴段都短于基础招式（闪避 < 轻击 0.36s，格挡 < 重击 0.60s）：
+// 防御不是「按下去就安全」，得卡准敌人出手的那一刻，容错很窄。
+// 耗体按「效果越彻底越贵」排：闪避完全免伤（20），格挡只减伤、仍要挨四成半（12）。
+const EVADE = { perform: 0.18, axis: 0.30, stamina: 20, tint: '#8fd0e8' };
+const GUARD = { perform: 0.16, axis: 0.50, stamina: 12, tint: '#c8c0a8' };
 // 格挡段的最初这段时间内被击中 → 招架（敌人硬直，我方回气）
-const GUARD_PARRY_WINDOW = 0.30;
+const GUARD_PARRY_WINDOW = 0.20;
 // 让招：不出招（无演出），只把时间轴往前放一段，用来调整节奏／回气（不耗体，总是可用）。
-// 轴段取得与轻击一致：够短，不会让玩家干等；又刚好回够一次轻击的体力（26 × 0.36 ≈ 9.4），
-// 所以体力见底时能靠它攒出下一手，而不是被永久卡住。
-const WAIT = { perform: 0, axis: BASE_MOVES.light.cd, stamina: 0, tint: '#6d6350' };
+// 轴段与闪避同长（0.30s）：够短，不会让玩家干等。
+// 一次让招回体 26 × 0.30 = 7.8，不足一次轻击（9），所以体力见底时要连让两下才凑得出一手；
+// 关键是它**不耗体且回体为正**，体力必然单调回升，不会被永久卡住。
+const WAIT = { perform: 0, axis: EVADE.axis, stamina: 0, tint: '#6d6350' };
 
 /**
  * perform  演出时长（时间轴冻结），需 ≥ 最后一段的 delay
  * cd       演出结束后在时间轴上占用的时长
+ * as       出招后接进序列时算作哪个基础招式（'light' / 'heavy'）；缺省表示序列真的清空
  * steps    技能的每一段伤害
  *   dmg      基础伤害
  *   delay    从出招起算的命中延迟（落在 perform 之内）
@@ -421,6 +435,7 @@ const SKILLS = [
     id: 'fengjuan',
     name: '风卷残云',
     pattern: ['light', 'light', 'light'],
+    as: 'light',        // 出招后接进序列时算作「轻」
     qi: 22,
     perform: 0.75,
     cd: 0.35,
@@ -437,6 +452,7 @@ const SKILLS = [
     id: 'baihong',
     name: '白虹贯日',
     pattern: ['light', 'light', 'heavy'],
+    as: 'heavy',        // 出招后接进序列时算作「重」
     qi: 30,
     perform: 1.03,
     cd: 0.55,
@@ -483,18 +499,28 @@ const SKILLS = [
   },
 ];
 
-// 绝学：U 键释放，消耗全部内力，伤害与消耗的内力成正比
+// 剑意：绝学「无明剑意」的资源，靠出招累积。
+// 与内力不同，剑意**跨战斗保留**（存进存档），所以绝学是「攒势」而不是「攒气」：
+// 一场打不满就留着下场继续攒，攒满的那一场可以开场就放。
+// 演武（training）不累积也不写回——对着木人桩刷剑意太容易，会架空这条资源。
+const INTENT = {
+  max: 100,
+  perBase: 2,      // 每记基础招式（轻／重）
+  perSkill: 12,    // 每记连招
+};
+
+// 绝学：U 键释放，需剑意满，释放后剑意清零。伤害随剑意上限与攻击倍率走
 const ULTIMATE = {
   id: 'wuming',
   name: '无明剑意',
-  minQi: 40,
-  perQi: 1.45,
+  intentCost: INTENT.max,
+  dmgPerIntent: 1.35,
   tint: '#c9a6ff',
   perform: 0.75,
-  cd: 1.65,
+  cd: 1.10,
   delay: 0.50,
   reach: 160,
-  desc: '凝全身真气于一剑。消耗全部内力，每点内力化为锋芒。',
+  desc: '剑意盈满，凝于一剑。每点剑意化为锋芒，出剑后剑意归零。',
 };
 
 function getSkillById(id) {
@@ -524,8 +550,24 @@ function skillClockTime(skill) {
   return t + skill.cd;
 }
 
+/** 连招序列的一项。via 记下它是从哪个招式接过来的（仅用于显示），move 是匹配用的等效基础招式 */
+function seqStep(move, via = null) {
+  return { move, via };
+}
+
+/** 取序列项的等效基础招式；兼容直接传 'light' / 'heavy' 的写法 */
+function stepMove(step) {
+  return step && step.move ? step.move : step;
+}
+
+/** 出招后的新序列：原序列清空；该招式若可当作基础招式（有 as），则作为一项接上 */
+function seqAfterSkill(skill) {
+  return skill.as ? [seqStep(skill.as, skill.id)] : [];
+}
+
 /**
  * 在序列后缀中寻找匹配的技能。
+ * 比较的是每一项的等效基础招式，所以「撩云式(轻)」与「轻」在匹配上等价。
  * 因为技能表前缀无关，这里最多只会命中一个；若确实命中多个，取最长者。
  */
 function matchSkill(seq) {
@@ -536,7 +578,7 @@ function matchSkill(seq) {
     let ok = true;
     const off = seq.length - p.length;
     for (let i = 0; i < p.length; i++) {
-      if (seq[off + i] !== p[i]) { ok = false; break; }
+      if (stepMove(seq[off + i]) !== p[i]) { ok = false; break; }
     }
     if (ok && (!best || p.length > best.pattern.length)) best = sk;
   }
@@ -548,7 +590,7 @@ function availableSkills(player) {
   return SKILLS.filter((s) => player.skills.includes(s.id));
 }
 
-return { BASE_MOVES: BASE_MOVES, SEQ_WINDOW: SEQ_WINDOW, QI_MAX: QI_MAX, STAM_MAX: STAM_MAX, STAM_REGEN: STAM_REGEN, QI_REGEN: QI_REGEN, EVADE: EVADE, GUARD: GUARD, GUARD_PARRY_WINDOW: GUARD_PARRY_WINDOW, WAIT: WAIT, SKILLS: SKILLS, ULTIMATE: ULTIMATE, getSkillById: getSkillById, skillTotalDamage: skillTotalDamage, skillLastHit: skillLastHit, skillFullTime: skillFullTime, skillClockTime: skillClockTime, matchSkill: matchSkill, availableSkills: availableSkills };
+return { BASE_MOVES: BASE_MOVES, SEQ_WINDOW: SEQ_WINDOW, QI_MAX: QI_MAX, STAM_MAX: STAM_MAX, STAM_REGEN: STAM_REGEN, QI_REGEN: QI_REGEN, EVADE: EVADE, GUARD: GUARD, GUARD_PARRY_WINDOW: GUARD_PARRY_WINDOW, WAIT: WAIT, SKILLS: SKILLS, INTENT: INTENT, ULTIMATE: ULTIMATE, getSkillById: getSkillById, skillTotalDamage: skillTotalDamage, skillLastHit: skillLastHit, skillFullTime: skillFullTime, skillClockTime: skillClockTime, seqStep: seqStep, stepMove: stepMove, seqAfterSkill: seqAfterSkill, matchSkill: matchSkill, availableSkills: availableSkills };
 });
 __def("src/data/items.js", [], function () {
 'use strict';
@@ -938,7 +980,7 @@ function expForLevel(level) {
 
 return { LOCATIONS: LOCATIONS, getLocation: getLocation, ROUTES: ROUTES, NPCS: NPCS, QUESTS: QUESTS, getQuest: getQuest, ATTRS: ATTRS, expForLevel: expForLevel };
 });
-__def("src/entities/Player.js", [["src/data/skills.js","BASE_MOVES"],["src/data/skills.js","QI_MAX"],["src/data/skills.js","STAM_MAX"],["src/data/items.js","getWeapon"],["src/data/items.js","getArmor"],["src/data/items.js","forgeBonus"],["src/data/world.js","expForLevel"]], function (BASE_MOVES, QI_MAX, STAM_MAX, getWeapon, getArmor, forgeBonus, expForLevel) {
+__def("src/entities/Player.js", [["src/data/skills.js","BASE_MOVES"],["src/data/skills.js","QI_MAX"],["src/data/skills.js","STAM_MAX"],["src/data/skills.js","INTENT"],["src/data/items.js","getWeapon"],["src/data/items.js","getArmor"],["src/data/items.js","forgeBonus"],["src/data/world.js","expForLevel"]], function (BASE_MOVES, QI_MAX, STAM_MAX, INTENT, getWeapon, getArmor, forgeBonus, expForLevel) {
 'use strict';
 // 玩家：属性、养成、存档
 
@@ -981,6 +1023,10 @@ class Player {
     this.maxCombo = 0;
     this.bestFloor = 0;
 
+    // 剑意：只在一次秘境探索内保留。
+    // 回镇即清空（见 BaseScene.enter），故**不进存档**——刷新/重开都等于脱离了秘境
+    this.intent = 0;
+
     // 气血与内力是「当前值」，不进存档，但必须给出初值：
     // 缺了 qi 会让读 P.qi 的地方算出 NaN（副本 HUD 曾显示「气 NaN/55」）
     this.hp = this.maxHp;
@@ -1001,6 +1047,8 @@ class Player {
   get maxStamina() {
     return STAM_MAX + this.attrs.agi * 1;
   }
+  get maxIntent() { return INTENT.max; }
+  get intentFull() { return this.intent >= INTENT.max; }
   get defense() {
     return this.armorData.def + this.weaponData.def + Math.floor(this.level * 0.4);
   }
@@ -1102,6 +1150,8 @@ class Player {
     }
     this.attrs = Object.assign({ str: 0, vit: 0, agi: 0, int: 0 }, data.attrs || {});
     this.items = Object.assign({}, data.items || {});
+    // 剑意不进存档，读档一律归零（旧档里可能残留该字段，不能读进来）
+    this.intent = 0;
     this.hp = this.maxHp;
     this.qi = this.maxQi;
     return this;
@@ -1957,6 +2007,8 @@ class BaseScene {
     // 回镇休整：气血与内力一并回满（内力在战斗之间是继承的）
     P.hp = P.maxHp;
     P.qi = P.maxQi;
+    // 剑意只在一次秘境探索内保留：回镇即脱离秘境，一并清空
+    P.intent = 0;
     this.mode = 'walk';
     this.panel = null;
     this.charPanel = null;
@@ -2118,6 +2170,12 @@ class BaseScene {
         action: () => this.startTrial(),
       },
       {
+        label: '演武 · 机关木人',
+        desc: '会还手的木人。起手、收招都真，用来练读轴——闪避、格挡、招架都得在这里试。',
+        value: '进入',
+        action: () => this.startSpar(),
+      },
+      {
         label: '重述要诀',
         desc: '轻重 J/K 出招；L 闪避、空格格挡、S 让招——都是排进时间轴的一段行动。',
         value: '',
@@ -2138,6 +2196,21 @@ class BaseScene {
     this.panel = null;
     this.game.goto('battle', {
       training: true,
+      theme: { wall: '#2b2822', floor: '#3a352c', accent: '#6f8f5c' },
+      onEnd: () => {
+        this.game.toast('演武结束', PAL.paperDim);
+        this.game.goto('base');
+      },
+    });
+  }
+
+  /** 机关木人：会还手的陪练。仍是演武——不计死亡、不给奖励 */
+  startSpar() {
+    this.mode = 'walk';
+    this.panel = null;
+    this.game.goto('battle', {
+      training: true,
+      spar: true,
       theme: { wall: '#2b2822', floor: '#3a352c', accent: '#6f8f5c' },
       onEnd: () => {
         this.game.toast('演武结束', PAL.paperDim);
@@ -2205,7 +2278,8 @@ class BaseScene {
       const afford = P.gold >= s.price;
       items.push({
         label: s.name,
-        desc: `${s.pattern.map((m) => (m === 'light' ? '轻' : '重')).join('·')}　耗气 ${s.qi}　${s.desc}`,
+        desc: `${s.pattern.map((m) => (m === 'light' ? '轻' : '重')).join('·')}　耗气 ${s.qi}　${s.desc}`
+          + (s.as ? `　出招后可当「${s.as === 'light' ? '轻' : '重'}」续接下一招` : ''),
         value: known ? '已习' : s.price === 0 ? '本就通晓' : `${s.price} 两`,
         tag: known ? `总伤 ${Math.round(skillTotalDamage(s))}` : '',
         disabled: known || !afford,
@@ -2776,6 +2850,8 @@ class BaseScene {
       text(ctx, k, x, y, { size: 12, color: '#8b8069' });
       text(ctx, String(v), x + 130, y, { size: 12, align: 'right', color: PAL.paper });
     });
+    // 剑意只在秘境里积攒，回镇必为 0——这里只说清规则，不显示数字
+    text(ctx, '剑意于秘境中积攒，出秘境即散', px + 30, py + 372, { size: 11, color: '#6d6350' });
 
     // 右：装备与剑招
     sectionTitle(ctx, px + 364, py + 74, '行装');
@@ -2808,9 +2884,13 @@ class BaseScene {
       text(ctx, `耗气 ${s.qi}`, px + 632, y, { size: 11, align: 'right', color: PAL.paperFaint });
       text(ctx, `${s.steps.length} 段 · 总伤 ${Math.round(skillTotalDamage(s))}`,
         px + 372, y + 11, { size: 10.5, color: '#8a8070' });
+      if (s.as) {
+        text(ctx, `接续 ${s.as === 'light' ? '轻' : '重'}`, px + 632, y + 11,
+          { size: 10.5, align: 'right', color: baseTint(s.tint) });
+      }
     });
 
-    text(ctx, '绝学：无明剑意　按 U　消耗全部内力（需 ≥40）',
+    text(ctx, '绝学：无明剑意　按 U　需剑意攒满（出招累积，跨战斗保留）',
       px + 372, py + ph - 24, { size: 11, color: '#8a6a2f' });
     text(ctx, '战斗为时间轴制：轮到你时冻结选行动，表演不入轴，只有 cd 段推进时间',
       px + 372, py + ph - 10, { size: 10.5, color: '#6d6350' });
@@ -3289,7 +3369,7 @@ const ENEMIES = [
     id: 'wolf',
     name: '野狗',
     tier: 1,
-    hp: 44,
+    hp: 130,
     atk: 6,
     def: 0,
     interval: [1.5, 2.3],
@@ -3300,7 +3380,7 @@ const ENEMIES = [
     accentColor: '#3d3225',
     intro: '一条瘦骨嶙峋的野狗，龇着牙绕圈。',
     moves: [
-      { name: '扑咬', windup: 0.52, impactDelay: 0.12, recover: 0.30, damage: 7, reach: 96, type: 'thrust' },
+      { name: '扑咬', windup: 0.52, impactDelay: 0.12, recover: 0.30, damage: 9, reach: 96, type: 'thrust' },
       { name: '绕圈', kind: 'rest', windup: 0.34, impactDelay: 0.10, recover: 0.24, heal: 6 },
     ],
   },
@@ -3308,7 +3388,7 @@ const ENEMIES = [
     id: 'bandit',
     name: '山贼',
     tier: 1,
-    hp: 62,
+    hp: 185,
     atk: 8,
     def: 1,
     interval: [1.7, 2.5],
@@ -3319,8 +3399,8 @@ const ENEMIES = [
     accentColor: '#4a3428',
     intro: '裹着破布衫的山贼，手中钢刀豁了口。',
     moves: [
-      { name: '横劈', windup: 0.60, impactDelay: 0.13, recover: 0.34, damage: 9, reach: 108, type: 'slash' },
-      { name: '突刺', windup: 0.74, impactDelay: 0.14, recover: 0.38, damage: 13, reach: 130, type: 'thrust' },
+      { name: '横劈', windup: 0.60, impactDelay: 0.13, recover: 0.34, damage: 11, reach: 108, type: 'slash' },
+      { name: '突刺', windup: 0.74, impactDelay: 0.14, recover: 0.38, damage: 16, reach: 130, type: 'thrust' },
       { name: '抱头', kind: 'defend', windup: 0.30, impactDelay: 0.10, recover: 0.26, guardMul: 0.40 },
     ],
   },
@@ -3328,7 +3408,7 @@ const ENEMIES = [
     id: 'viper',
     name: '碧纹蛇',
     tier: 1,
-    hp: 38,
+    hp: 115,
     atk: 9,
     def: 0,
     interval: [1.2, 1.9],
@@ -3339,15 +3419,15 @@ const ENEMIES = [
     accentColor: '#2c4a30',
     intro: '青鳞细蛇盘在落叶间，吐着信子。',
     moves: [
-      { name: '吐信', windup: 0.40, impactDelay: 0.09, recover: 0.26, damage: 6, reach: 84, type: 'thrust' },
-      { name: '缠咬', windup: 0.56, impactDelay: 0.11, recover: 0.30, damage: 11, reach: 92, type: 'multi', hits: 2 },
+      { name: '吐信', windup: 0.40, impactDelay: 0.09, recover: 0.26, damage: 8, reach: 84, type: 'thrust' },
+      { name: '缠咬', windup: 0.56, impactDelay: 0.11, recover: 0.30, damage: 14, reach: 92, type: 'multi', hits: 2 },
     ],
   },
   {
     id: 'thug',
     name: '泼皮',
     tier: 1,
-    hp: 52,
+    hp: 155,
     atk: 7,
     def: 0,
     interval: [1.1, 1.7],
@@ -3358,8 +3438,8 @@ const ENEMIES = [
     accentColor: '#4a3a22',
     intro: '街面上混日子的泼皮，出手又急又乱。',
     moves: [
-      { name: '乱拳', windup: 0.36, impactDelay: 0.09, recover: 0.22, damage: 5, reach: 92, type: 'multi', hits: 2 },
-      { name: '踹腿', windup: 0.50, impactDelay: 0.11, recover: 0.26, damage: 9, reach: 104, type: 'slam' },
+      { name: '乱拳', windup: 0.36, impactDelay: 0.09, recover: 0.22, damage: 6, reach: 92, type: 'multi', hits: 2 },
+      { name: '踹腿', windup: 0.50, impactDelay: 0.11, recover: 0.26, damage: 11, reach: 104, type: 'slam' },
       { name: '退开', kind: 'rest', windup: 0.28, impactDelay: 0.08, recover: 0.20, heal: 5 },
     ],
   },
@@ -3367,7 +3447,7 @@ const ENEMIES = [
     id: 'lancer',
     name: '长枪手',
     tier: 2,
-    hp: 76,
+    hp: 230,
     atk: 12,
     def: 2,
     interval: [1.5, 2.2],
@@ -3378,8 +3458,8 @@ const ENEMIES = [
     accentColor: '#32402a',
     intro: '端着一杆长枪，枪尖始终指着你的咽喉。',
     moves: [
-      { name: '直刺', windup: 0.62, impactDelay: 0.13, recover: 0.32, damage: 15, reach: 146, type: 'thrust' },
-      { name: '挑枪', windup: 0.50, impactDelay: 0.11, recover: 0.28, damage: 10, reach: 128, type: 'slash' },
+      { name: '直刺', windup: 0.62, impactDelay: 0.13, recover: 0.32, damage: 21, reach: 146, type: 'thrust' },
+      { name: '挑枪', windup: 0.50, impactDelay: 0.11, recover: 0.28, damage: 14, reach: 128, type: 'slash' },
       { name: '收枪', kind: 'defend', windup: 0.28, impactDelay: 0.09, recover: 0.24, guardMul: 0.45 },
     ],
   },
@@ -3387,7 +3467,7 @@ const ENEMIES = [
     id: 'blade',
     name: '黑衣刀客',
     tier: 2,
-    hp: 88,
+    hp: 265,
     atk: 12,
     def: 3,
     interval: [1.6, 2.4],
@@ -3398,9 +3478,9 @@ const ENEMIES = [
     accentColor: '#22222c',
     intro: '黑衣蒙面，刀未出鞘，杀气已至。',
     moves: [
-      { name: '拔刀斩', windup: 0.55, impactDelay: 0.12, recover: 0.30, damage: 14, reach: 118, type: 'slash' },
-      { name: '连环斩', windup: 0.68, impactDelay: 0.12, recover: 0.34, damage: 9, reach: 112, type: 'multi', hits: 3 },
-      { name: '背刺', windup: 0.80, impactDelay: 0.15, recover: 0.38, damage: 22, reach: 138, type: 'thrust' },
+      { name: '拔刀斩', windup: 0.55, impactDelay: 0.12, recover: 0.30, damage: 20, reach: 118, type: 'slash' },
+      { name: '连环斩', windup: 0.68, impactDelay: 0.12, recover: 0.34, damage: 13, reach: 112, type: 'multi', hits: 3 },
+      { name: '背刺', windup: 0.80, impactDelay: 0.15, recover: 0.38, damage: 31, reach: 138, type: 'thrust' },
       { name: '沉肩', kind: 'rest', windup: 0.32, impactDelay: 0.09, recover: 0.26, heal: 8 },
     ],
   },
@@ -3408,7 +3488,7 @@ const ENEMIES = [
     id: 'zombie',
     name: '尸傀',
     tier: 2,
-    hp: 130,
+    hp: 390,
     atk: 13,
     def: 6,
     interval: [2.2, 3.2],
@@ -3419,8 +3499,8 @@ const ENEMIES = [
     accentColor: '#3f4438',
     intro: '皮肤青灰的尸傀，动作迟滞却力大无穷。',
     moves: [
-      { name: '钝击', windup: 0.82, impactDelay: 0.16, recover: 0.36, damage: 20, reach: 104, type: 'slam' },
-      { name: '横扫', windup: 1.00, impactDelay: 0.18, recover: 0.42, damage: 24, reach: 122, type: 'slam', knockback: 60 },
+      { name: '钝击', windup: 0.82, impactDelay: 0.16, recover: 0.36, damage: 28, reach: 104, type: 'slam' },
+      { name: '横扫', windup: 1.00, impactDelay: 0.18, recover: 0.42, damage: 34, reach: 122, type: 'slam', knockback: 60 },
       { name: '僵立', kind: 'rest', windup: 0.46, impactDelay: 0.12, recover: 0.34, heal: 12 },
     ],
   },
@@ -3428,7 +3508,7 @@ const ENEMIES = [
     id: 'warden',
     name: '铁卫',
     tier: 3,
-    hp: 168,
+    hp: 505,
     atk: 15,
     def: 11,
     interval: [1.7, 2.5],
@@ -3439,8 +3519,8 @@ const ENEMIES = [
     accentColor: '#2a303a',
     intro: '披着重甲的护卫，铁盾一横，刀枪难入。',
     moves: [
-      { name: '盾撞', windup: 0.66, impactDelay: 0.13, recover: 0.34, damage: 17, reach: 112, type: 'slam', knockback: 50 },
-      { name: '斩击', windup: 0.54, impactDelay: 0.12, recover: 0.30, damage: 14, reach: 124, type: 'slash' },
+      { name: '盾撞', windup: 0.66, impactDelay: 0.13, recover: 0.34, damage: 24, reach: 112, type: 'slam', knockback: 50 },
+      { name: '斩击', windup: 0.54, impactDelay: 0.12, recover: 0.30, damage: 20, reach: 124, type: 'slash' },
       { name: '举盾', kind: 'defend', windup: 0.34, impactDelay: 0.10, recover: 0.30, guardMul: 0.25 },
     ],
   },
@@ -3448,7 +3528,7 @@ const ENEMIES = [
     id: 'monk',
     name: '刀疤僧',
     tier: 3,
-    hp: 190,
+    hp: 570,
     atk: 16,
     def: 8,
     interval: [1.6, 2.3],
@@ -3460,9 +3540,9 @@ const ENEMIES = [
     accentColor: '#5a3420',
     intro: '满脸刀疤的僧人扛着戒刀，咧嘴一笑。',
     moves: [
-      { name: '戒刀斩', windup: 0.58, impactDelay: 0.12, recover: 0.32, damage: 18, reach: 126, type: 'slash' },
-      { name: '金刚杵', windup: 0.88, impactDelay: 0.17, recover: 0.40, damage: 30, reach: 118, type: 'slam', knockback: 70 },
-      { name: '狮子吼', windup: 0.72, impactDelay: 0.13, recover: 0.32, damage: 12, reach: 150, type: 'multi', hits: 2 },
+      { name: '戒刀斩', windup: 0.58, impactDelay: 0.12, recover: 0.32, damage: 25, reach: 126, type: 'slash' },
+      { name: '金刚杵', windup: 0.88, impactDelay: 0.17, recover: 0.40, damage: 42, reach: 118, type: 'slam', knockback: 70 },
+      { name: '狮子吼', windup: 0.72, impactDelay: 0.13, recover: 0.32, damage: 17, reach: 150, type: 'multi', hits: 2 },
       { name: '铁布衫', kind: 'defend', windup: 0.40, impactDelay: 0.11, recover: 0.32, guardMul: 0.30 },
     ],
   },
@@ -3470,7 +3550,7 @@ const ENEMIES = [
     id: 'assassin',
     name: '夜行刺客',
     tier: 4,
-    hp: 175,
+    hp: 525,
     atk: 24,
     def: 5,
     interval: [1.1, 1.7],
@@ -3481,8 +3561,8 @@ const ENEMIES = [
     accentColor: '#181622',
     intro: '来去无声，刀锋上淬着夜露。',
     moves: [
-      { name: '刺客突袭', windup: 0.38, impactDelay: 0.09, recover: 0.24, damage: 20, reach: 128, type: 'thrust' },
-      { name: '双刃连击', windup: 0.55, impactDelay: 0.10, recover: 0.28, damage: 12, reach: 116, type: 'multi', hits: 3 },
+      { name: '刺客突袭', windup: 0.38, impactDelay: 0.09, recover: 0.24, damage: 30, reach: 128, type: 'thrust' },
+      { name: '双刃连击', windup: 0.55, impactDelay: 0.10, recover: 0.28, damage: 18, reach: 116, type: 'multi', hits: 3 },
       { name: '潜形', kind: 'defend', windup: 0.26, impactDelay: 0.08, recover: 0.22, guardMul: 0.35 },
     ],
   },
@@ -3490,7 +3570,7 @@ const ENEMIES = [
     id: 'shadow',
     name: '影卫统领',
     tier: 4,
-    hp: 260,
+    hp: 780,
     atk: 21,
     def: 10,
     interval: [1.35, 2.0],
@@ -3502,10 +3582,10 @@ const ENEMIES = [
     accentColor: '#191926',
     intro: '影卫统领负手而立，剑在鞘中，气机却已锁住全身。',
     moves: [
-      { name: '影袭', windup: 0.45, impactDelay: 0.10, recover: 0.28, damage: 17, reach: 130, type: 'thrust' },
-      { name: '乱影', windup: 0.62, impactDelay: 0.11, recover: 0.30, damage: 11, reach: 118, type: 'multi', hits: 4 },
-      { name: '封喉', windup: 0.92, impactDelay: 0.16, recover: 0.40, damage: 38, reach: 146, type: 'thrust' },
-      { name: '剑罡', windup: 0.78, impactDelay: 0.15, recover: 0.34, damage: 26, reach: 168, type: 'slam', knockback: 60 },
+      { name: '影袭', windup: 0.45, impactDelay: 0.10, recover: 0.28, damage: 26, reach: 130, type: 'thrust' },
+      { name: '乱影', windup: 0.62, impactDelay: 0.11, recover: 0.30, damage: 17, reach: 118, type: 'multi', hits: 4 },
+      { name: '封喉', windup: 0.92, impactDelay: 0.16, recover: 0.40, damage: 57, reach: 146, type: 'thrust' },
+      { name: '剑罡', windup: 0.78, impactDelay: 0.15, recover: 0.34, damage: 39, reach: 168, type: 'slam', knockback: 60 },
       { name: '凝气', kind: 'rest', windup: 0.34, impactDelay: 0.10, recover: 0.28, heal: 16 },
     ],
   },
@@ -3513,7 +3593,7 @@ const ENEMIES = [
     id: 'master',
     name: '无明剑主',
     tier: 5,
-    hp: 360,
+    hp: 1080,
     atk: 26,
     def: 13,
     interval: [1.2, 1.8],
@@ -3525,15 +3605,48 @@ const ENEMIES = [
     accentColor: '#2a1622',
     intro: '「无名者，方得无明之剑。」剑主缓缓抬手。',
     moves: [
-      { name: '无明斩', windup: 0.48, impactDelay: 0.11, recover: 0.28, damage: 22, reach: 132, type: 'slash' },
-      { name: '落英', windup: 0.60, impactDelay: 0.10, recover: 0.28, damage: 13, reach: 122, type: 'multi', hits: 5 },
-      { name: '断念', windup: 0.88, impactDelay: 0.16, recover: 0.38, damage: 44, reach: 150, type: 'thrust' },
-      { name: '剑意', windup: 0.98, impactDelay: 0.18, recover: 0.42, damage: 34, reach: 178, type: 'slam', knockback: 80 },
+      { name: '无明斩', windup: 0.48, impactDelay: 0.11, recover: 0.28, damage: 39, reach: 132, type: 'slash' },
+      { name: '落英', windup: 0.60, impactDelay: 0.10, recover: 0.28, damage: 24, reach: 122, type: 'multi', hits: 5 },
+      { name: '断念', windup: 0.88, impactDelay: 0.16, recover: 0.38, damage: 82, reach: 150, type: 'thrust' },
+      { name: '剑意', windup: 0.98, impactDelay: 0.18, recover: 0.42, damage: 62, reach: 178, type: 'slam', knockback: 80 },
       { name: '养剑', kind: 'rest', windup: 0.32, impactDelay: 0.10, recover: 0.26, heal: 22 },
       { name: '剑罡护体', kind: 'defend', windup: 0.36, impactDelay: 0.11, recover: 0.30, guardMul: 0.28 },
     ],
   },
 ];
+
+/**
+ * 轴上的出手间隔 = interval × 该系数。
+ * interval 原本的语义是「两次出手的间隔」，但现在的模型里表演已单独占用一段真实时间，
+ * 故只取其中一部分作为轴上间隔。调大 = 敌人更慢，调小 = 更密。
+ */
+const INTERVAL_SCALE = 0.36;
+
+/**
+ * 演武用的机关木人：会还手的陪练，不进副本抽取池。
+ * 三类行动俱全（攻击 / 防御 / 歇息），出手比同阶敌人慢，专门给玩家练读轴。
+ */
+const SPAR_DUMMY = {
+  id: 'spar',
+  name: '机关木人',
+  tier: 0,
+  hp: 10000,
+  atk: 0,
+  def: 2,
+  interval: [2.6, 3.4],
+  exp: 0,
+  gold: [0, 0],
+  size: 1.0,
+  bodyColor: '#7d6a4e',
+  accentColor: '#c8a24a',
+  intro: '上了机括的木人，会起手也会收招。用来练读轴与接招。',
+  moves: [
+    { name: '横击', windup: 0.62, impactDelay: 0.12, recover: 0.32, damage: 7, reach: 104, type: 'slash' },
+    { name: '重压', windup: 0.90, impactDelay: 0.14, recover: 0.42, damage: 12, reach: 118, type: 'slam' },
+    { name: '架臂', kind: 'defend', windup: 0.30, impactDelay: 0.10, recover: 0.26, guardMul: 0.40 },
+    { name: '歇机', kind: 'rest', windup: 0.34, impactDelay: 0.10, recover: 0.24, heal: 8 },
+  ],
+};
 
 /** 行动类型：缺省即普通攻击 */
 function moveKind(mv) {
@@ -3567,11 +3680,152 @@ function bossForTier(tier) {
   return best;
 }
 
-return { ENEMIES: ENEMIES, moveKind: moveKind, getEnemy: getEnemy, rollEnemyForTier: rollEnemyForTier, bossForTier: bossForTier };
+return { ENEMIES: ENEMIES, INTERVAL_SCALE: INTERVAL_SCALE, SPAR_DUMMY: SPAR_DUMMY, moveKind: moveKind, getEnemy: getEnemy, rollEnemyForTier: rollEnemyForTier, bossForTier: bossForTier };
 });
-__def("src/scenes/DungeonScene.js", [["src/core/utils.js","PAL"],["src/core/utils.js","FONT"],["src/core/utils.js","clamp"],["src/core/utils.js","lerp"],["src/core/utils.js","rand"],["src/core/utils.js","randInt"],["src/core/utils.js","hash2"],["src/core/utils.js","fillRect"],["src/core/utils.js","text"],["src/core/utils.js","roundRectPath"],["src/core/utils.js","strokeText"],["src/core/utils.js","easeOutQuad"],["src/core/utils.js","bar"],["src/core/input.js","isDown"],["src/core/input.js","justPressed"],["src/core/input.js","isAnyDown"],["src/data/world.js","getLocation"],["src/data/world.js","getQuest"],["src/data/world.js","QUESTS"],["src/data/enemies.js","rollEnemyForTier"],["src/data/enemies.js","bossForTier"],["src/data/enemies.js","getEnemy"],["src/data/items.js","getItem"],["src/data/items.js","rollDrop"],["src/ui/widgets.js","drawFigure"],["src/ui/widgets.js","keyCap"],["src/core/audio.js","sfx"]], function (PAL, FONT, clamp, lerp, rand, randInt, hash2, fillRect, text, roundRectPath, strokeText, easeOutQuad, bar, isDown, justPressed, isAnyDown, getLocation, getQuest, QUESTS, rollEnemyForTier, bossForTier, getEnemy, getItem, rollDrop, drawFigure, keyCap, sfx) {
+__def("src/ui/charPanel.js", [["src/core/utils.js","PAL"],["src/core/utils.js","roundRectPath"],["src/core/utils.js","text"],["src/core/utils.js","bar"],["src/core/utils.js","fillRect"],["src/data/skills.js","BASE_MOVES"],["src/data/skills.js","SKILLS"],["src/data/skills.js","ULTIMATE"],["src/data/skills.js","INTENT"],["src/data/skills.js","QI_REGEN"],["src/data/skills.js","STAM_REGEN"],["src/data/skills.js","skillTotalDamage"],["src/data/world.js","ATTRS"],["src/ui/widgets.js","sectionTitle"]], function (PAL, roundRectPath, text, bar, fillRect, BASE_MOVES, SKILLS, ULTIMATE, INTENT, QI_REGEN, STAM_REGEN, skillTotalDamage, ATTRS, sectionTitle) {
+'use strict';
+// 人物信息面板（战斗与秘境共用）
+//
+// 两处都要「按 C 看人」，但取数来源不同：
+//   · 战斗里看的是本场的运行时快照（this.p）——气血体力都是这一场剩多少
+//   · 秘境里没有战斗快照，直接读玩家（HP/气/剑意），且体力在战斗外无意义
+// 所以这里只接一个「视图」对象，不关心调用方是谁。
+
+
+
+
+
+
+const PW = 700;
+const PH = 456;
+
+function panelBox(ctx, x, y, w, h, border) {
+  ctx.save();
+  roundRectPath(ctx, x, y, w, h, 5);
+  ctx.fillStyle = 'rgba(14,11,8,0.9)';
+  ctx.fill();
+  ctx.strokeStyle = border;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * @param view  { hp, maxHp, qi, maxQi, stam, maxStam, intent, maxIntent,
+ *                showStam, armorDefense, tip }
+ *               stam / maxStam 留空即不显示体力一条（秘境里没有这个资源）
+ */
+function renderCharPanel(ctx, W, H, P, view) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.74)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+
+  const px = Math.round((W - PW) / 2), py = Math.round((H - PH) / 2);
+  panelBox(ctx, px, py, PW, PH, PAL.line2);
+
+  text(ctx, '人物', px + 26, py + 34, { size: 19, weight: 700, color: PAL.gold });
+  text(ctx, `Lv.${P.level}　${P.exp}/${P.expToNext} 历练　剩余修为 ${P.attrPoints}`,
+    px + 106, py + 34, { size: 13, color: PAL.paperDim });
+  text(ctx, 'Esc/C 关闭', px + PW - 26, py + 34, {
+    size: 12, align: 'right', color: PAL.paperFaint,
+  });
+  fillRect(ctx, px + 26, py + 46, PW - 52, 1, 'rgba(233,223,200,0.16)');
+
+  // ---- 左：当前状态（各行按需出现，故用 lineno 递增而非下标） ----
+  sectionTitle(ctx, px + 26, py + 70, '当前');
+  const intentFull = view.intent >= view.maxIntent;
+  const rowsDef = [
+    ['气血', view.hp, view.maxHp, PAL.hp, false, ''],
+    ['内力', view.qi, view.maxQi, PAL.qi, false, `回 ${(P.qiRegenMul * QI_REGEN).toFixed(1)}/s`],
+    ['体力', view.stam, view.maxStam, PAL.stam, false, `回 ${STAM_REGEN}/s`],
+    ['剑意', view.intent, view.maxIntent, ULTIMATE.tint, intentFull,
+      `出招 +${INTENT.perBase}／连招 +${INTENT.perSkill}`],
+  ].filter((r) => view.showStam !== false || r[0] !== '体力');
+
+  rowsDef.forEach(([name, v, max, col, full, note], i) => {
+    const y = py + 86 + i * 30;
+    const bw = 212;
+    bar(ctx, px + 26, y, bw, 14, v / max, col, {
+      r: 3,
+      border: full ? 'rgba(233,214,255,0.95)' : 'rgba(0,0,0,0.55)',
+    });
+    text(ctx, `${name} ${Math.floor(v)} / ${max}`, px + 26 + bw / 2, y + 7.5, {
+      size: 10.5, align: 'center', baseline: 'middle', color: 'rgba(255,255,255,0.94)',
+    });
+    if (note) text(ctx, note, px + 250, y + 7.5, { size: 10, baseline: 'middle', color: '#7d735e' });
+  });
+
+  const attrTop = py + 86 + rowsDef.length * 30 + 10;
+  sectionTitle(ctx, px + 26, attrTop, '根基');
+  ATTRS.forEach((a, i) => {
+    const y = attrTop + 24 + i * 24;
+    text(ctx, a.name, px + 30, y, { size: 12.5, color: a.color });
+    text(ctx, String(P.attrs[a.id]), px + 160, y, { size: 12.5, align: 'right', color: PAL.paper });
+    text(ctx, a.desc, px + 176, y, { size: 10.5, color: '#7d735e' });
+  });
+
+  // ---- 右：身手 / 兵装 / 剑招 ----
+  sectionTitle(ctx, px + 364, py + 70, '身手');
+  const stam = view.showStam === false ? Infinity : view.stam;
+  const hits = [
+    ['轻招伤害', `${P.lightDamage.toFixed(1)}${stam < BASE_MOVES.light.stamina ? '　体力不足' : ''}`],
+    ['重招伤害', `${P.heavyDamage.toFixed(1)}${stam < BASE_MOVES.heavy.stamina ? '　体力不足' : ''}`],
+    ['护体', Math.round(view.armorDefense == null ? P.defense : view.armorDefense)],
+    ['出招速度', `${(1 / P.speedMul * 100).toFixed(0)}%`],
+  ];
+  hits.forEach(([k, v], i) => {
+    const x = px + 372 + (i % 2) * 158;
+    const y = py + 94 + Math.floor(i / 2) * 22;
+    text(ctx, k, x, y, { size: 12, color: '#8b8069' });
+    text(ctx, String(v), x + 146, y, { size: 12, align: 'right', color: PAL.paper });
+  });
+
+  sectionTitle(ctx, px + 364, py + 148, '兵装');
+  const w = P.weaponData;
+  const ar = P.armorData;
+  const equip = [
+    ['兵器', `${w.name} +${P.weaponLevel}`,
+      `轻+${w.lightBonus + P.forge.light}　重+${w.heavyBonus + P.forge.heavy}　内力+${w.qiMax + P.forge.qi}`],
+    ['护具', ar.name, `气血+${ar.hpMax}　护体+${ar.def}`],
+  ];
+  equip.forEach(([k, v, sub], i) => {
+    const y = py + 172 + i * 30;
+    text(ctx, k, px + 372, y, { size: 12.5, color: PAL.paperDim });
+    text(ctx, v, px + 632, y, { size: 12.5, align: 'right', color: PAL.paper });
+    text(ctx, sub, px + 372, y + 13, { size: 10.5, color: '#7d735e' });
+  });
+
+  sectionTitle(ctx, px + 364, py + 244, `剑招 (${P.skills.length}/${SKILLS.length})`);
+  P.skills.forEach((sid, i) => {
+    const s = SKILLS.find((x) => x.id === sid);
+    if (!s) return;
+    const y = py + 268 + i * 26;
+    const pat = s.pattern.map((m) => (m === 'light' ? '轻' : '重')).join('·');
+    const afford = view.qi >= s.qi;
+    text(ctx, pat, px + 372, y, { size: 12.5, weight: 700, color: s.tint });
+    text(ctx, s.name, px + 424, y, { size: 13.5, color: afford ? PAL.paper : '#8a7f6d' });
+    text(ctx, `耗气 ${s.qi}`, px + 632, y, {
+      size: 11, align: 'right', color: afford ? PAL.paperFaint : '#8a6a2f',
+    });
+    const extra = `总伤 ${Math.round(skillTotalDamage(s) * P.attackMul)}`
+      + (s.as ? `　接续${s.as === 'light' ? '轻' : '重'}` : '');
+    text(ctx, extra, px + 372, y + 11, { size: 10.5, color: '#8a8070' });
+  });
+
+  // 提示行独占一行空白（上方 6 条剑招最多画到 py+409），避免与剑招小字叠在一起
+  if (view.tip) {
+    fillRect(ctx, px + 26, py + PH - 34, PW - 52, 1, 'rgba(233,223,200,0.10)');
+    text(ctx, view.tip, px + 26, py + PH - 16, { size: 11.5, color: '#8a6a2f' });
+  }
+}
+
+return { renderCharPanel: renderCharPanel };
+});
+__def("src/scenes/DungeonScene.js", [["src/core/utils.js","PAL"],["src/core/utils.js","FONT"],["src/core/utils.js","clamp"],["src/core/utils.js","lerp"],["src/core/utils.js","rand"],["src/core/utils.js","randInt"],["src/core/utils.js","hash2"],["src/core/utils.js","fillRect"],["src/core/utils.js","text"],["src/core/utils.js","roundRectPath"],["src/core/utils.js","strokeText"],["src/core/utils.js","easeOutQuad"],["src/core/utils.js","bar"],["src/core/input.js","isDown"],["src/core/input.js","justPressed"],["src/core/input.js","isAnyDown"],["src/data/world.js","getLocation"],["src/data/world.js","getQuest"],["src/data/world.js","QUESTS"],["src/data/enemies.js","rollEnemyForTier"],["src/data/enemies.js","bossForTier"],["src/data/enemies.js","getEnemy"],["src/data/items.js","getItem"],["src/data/items.js","rollDrop"],["src/ui/widgets.js","drawFigure"],["src/ui/widgets.js","keyCap"],["src/ui/charPanel.js","renderCharPanel"],["src/core/audio.js","sfx"]], function (PAL, FONT, clamp, lerp, rand, randInt, hash2, fillRect, text, roundRectPath, strokeText, easeOutQuad, bar, isDown, justPressed, isAnyDown, getLocation, getQuest, QUESTS, rollEnemyForTier, bossForTier, getEnemy, getItem, rollDrop, drawFigure, keyCap, renderCharPanel, sfx) {
 'use strict';
 // 副本场景：格子地图探索
+
 
 
 
@@ -3591,10 +3845,12 @@ class DungeonScene {
   constructor(game) {
     this.game = game;
     this.map = null;
+    this.showChar = false;   // 按 C 查看人物信息（打开时整张地图冻结）
     this._onBattleEnd = this._onBattleEnd.bind(this);
   }
 
   enter(args = {}) {
+    this.showChar = false;
     if (args.resume && this.map) {
       this.battleCooldown = 1.1;
       this.flash = { text: '归来', t: 0, color: PAL.jadeHi };
@@ -3637,6 +3893,9 @@ class DungeonScene {
     this.stepT = 0;
     this.animT = 0;
     this.battleCooldown = 1.2;
+    // 剑意随一次秘境探索而生灭：踏进第一层即从零开始
+    // （回镇时已经清过，这里是双保险，防止日后新增入口时漏清）
+    if (this.floor === 1) this.game.player.intent = 0;
     this.reveal();
     this.cam = { x: 0, y: 0 };
     this.snapCam();
@@ -3830,6 +4089,15 @@ class DungeonScene {
 
   // ---------------- 更新 ----------------
   update(dt) {
+    // 人物面板打开时整张地图冻结（包括巡逻的敌人），看信息不吃亏
+    if (this.showChar) {
+      if (justPressed('KeyC') || justPressed('KeyI') || justPressed('Escape')) {
+        this.showChar = false;
+        sfx.ui();
+      }
+      return;
+    }
+
     this.animT += dt;
     if (this.flash) {
       this.flash.t += dt;
@@ -3842,6 +4110,13 @@ class DungeonScene {
     this.updateEnemies(dt);
     this.updateCam(dt);
     this.checkPickups();
+
+    // 随时可查人物信息（C / I）
+    if (justPressed('KeyC') || justPressed('KeyI')) {
+      this.showChar = true;
+      sfx.ui();
+      return;
+    }
 
     if (justPressed('Escape')) {
       this.game.toast('离开副本，进度不保。', PAL.crimsonHi);
@@ -4202,6 +4477,16 @@ class DungeonScene {
     ctx.fillRect(0, 0, W, H);
 
     this.renderUI(ctx);
+    if (this.showChar) {
+      const P = this.game.player;
+      renderCharPanel(ctx, W, H, P, {
+        hp: P.hp, maxHp: P.maxHp,
+        qi: P.qi, maxQi: P.maxQi,
+        intent: P.intent, maxIntent: P.maxIntent,
+        showStam: false,      // 体力是战斗内资源，走图时没有意义
+        tip: '剑意随本次秘境探索而生灭，出秘境即散',
+      });
+    }
   }
 
   renderMap(ctx) {
@@ -4433,13 +4718,24 @@ class DungeonScene {
       size: 10, align: 'center', baseline: 'middle', color: 'rgba(255,255,255,0.94)',
     });
 
+    // 剑意是秘境内的资源，走图时也要能看见攒到哪了
+    const intentR = clamp(P.intent / P.maxIntent, 0, 1);
+    const intentFull = P.intent >= P.maxIntent;
+    bar(ctx, 266, barY, barW, barH, intentR, '#c9a6ff', {
+      r: 3, flat: true,
+      border: intentFull ? 'rgba(233,214,255,0.95)' : 'rgba(0,0,0,0.55)',
+    });
+    text(ctx, `意 ${Math.floor(P.intent)}/${P.maxIntent}`, 266 + barW / 2, barY + barH / 2 + 0.5, {
+      size: 10, align: 'center', baseline: 'middle', color: 'rgba(255,255,255,0.94)',
+    });
+
     // 小地图
     this.renderMinimap(ctx);
 
     // 底部提示
     ctx.save();
     ctx.globalAlpha = 0.72;
-    const hint = 'WASD / 方向键 移动    ·    走到传送光门进入下一层    ·    Esc 撤离';
+    const hint = 'WASD / 方向键 移动    ·    走到传送光门进入下一层    ·    C 人物    ·    Esc 撤离';
     text(ctx, hint, W / 2, H - 16, { size: 12, align: 'center', color: PAL.paperDim });
     ctx.restore();
 
@@ -4519,7 +4815,7 @@ function shade(hex, k) {
 
 return { DungeonScene: DungeonScene };
 });
-__def("src/scenes/BattleScene.js", [["src/data/skills.js","BASE_MOVES"],["src/data/skills.js","SKILLS"],["src/data/skills.js","ULTIMATE"],["src/data/skills.js","SEQ_WINDOW"],["src/data/skills.js","matchSkill"],["src/data/skills.js","QI_REGEN"],["src/data/skills.js","STAM_REGEN"],["src/data/skills.js","EVADE"],["src/data/skills.js","GUARD"],["src/data/skills.js","GUARD_PARRY_WINDOW"],["src/data/skills.js","WAIT"],["src/data/enemies.js","getEnemy"],["src/data/enemies.js","moveKind"],["src/data/items.js","getItem"],["src/data/items.js","rollDrop"],["src/core/utils.js","PAL"],["src/core/utils.js","FONT"],["src/core/utils.js","clamp"],["src/core/utils.js","lerp"],["src/core/utils.js","rand"],["src/core/utils.js","randInt"],["src/core/utils.js","fillRect"],["src/core/utils.js","roundRectPath"],["src/core/utils.js","text"],["src/core/utils.js","bar"],["src/core/utils.js","easeOutCubic"],["src/core/utils.js","strokeText"],["src/core/utils.js","measure"],["src/core/input.js","justPressed"],["src/ui/widgets.js","drawFigure"],["src/core/audio.js","sfx"]], function (BASE_MOVES, SKILLS, ULTIMATE, SEQ_WINDOW, matchSkill, QI_REGEN, STAM_REGEN, EVADE, GUARD, GUARD_PARRY_WINDOW, WAIT, getEnemy, moveKind, getItem, rollDrop, PAL, FONT, clamp, lerp, rand, randInt, fillRect, roundRectPath, text, bar, easeOutCubic, strokeText, measure, justPressed, drawFigure, sfx) {
+__def("src/scenes/BattleScene.js", [["src/data/skills.js","BASE_MOVES"],["src/data/skills.js","SKILLS"],["src/data/skills.js","ULTIMATE"],["src/data/skills.js","INTENT"],["src/data/skills.js","SEQ_WINDOW"],["src/data/skills.js","matchSkill"],["src/data/skills.js","seqStep"],["src/data/skills.js","stepMove"],["src/data/skills.js","seqAfterSkill"],["src/data/skills.js","QI_REGEN"],["src/data/skills.js","STAM_REGEN"],["src/data/skills.js","EVADE"],["src/data/skills.js","GUARD"],["src/data/skills.js","GUARD_PARRY_WINDOW"],["src/data/skills.js","WAIT"],["src/data/enemies.js","getEnemy"],["src/data/enemies.js","moveKind"],["src/data/enemies.js","SPAR_DUMMY"],["src/data/enemies.js","INTERVAL_SCALE"],["src/data/items.js","getItem"],["src/data/items.js","rollDrop"],["src/core/utils.js","PAL"],["src/core/utils.js","FONT"],["src/core/utils.js","clamp"],["src/core/utils.js","lerp"],["src/core/utils.js","rand"],["src/core/utils.js","randInt"],["src/core/utils.js","fillRect"],["src/core/utils.js","roundRectPath"],["src/core/utils.js","text"],["src/core/utils.js","bar"],["src/core/utils.js","easeOutCubic"],["src/core/utils.js","strokeText"],["src/core/utils.js","measure"],["src/core/input.js","justPressed"],["src/ui/widgets.js","drawFigure"],["src/ui/charPanel.js","renderCharPanel"],["src/core/audio.js","sfx"]], function (BASE_MOVES, SKILLS, ULTIMATE, INTENT, SEQ_WINDOW, matchSkill, seqStep, stepMove, seqAfterSkill, QI_REGEN, STAM_REGEN, EVADE, GUARD, GUARD_PARRY_WINDOW, WAIT, getEnemy, moveKind, SPAR_DUMMY, INTERVAL_SCALE, getItem, rollDrop, PAL, FONT, clamp, lerp, rand, randInt, fillRect, roundRectPath, text, bar, easeOutCubic, strokeText, measure, justPressed, drawFigure, renderCharPanel, sfx) {
 'use strict';
 // 战斗场景：单时间轴驱动的回合节奏战斗
 //
@@ -4560,6 +4856,7 @@ __def("src/scenes/BattleScene.js", [["src/data/skills.js","BASE_MOVES"],["src/da
 
 
 
+
 const GROUND_Y = 402;
 const P_X = 300;
 const E_X = 662;
@@ -4589,6 +4886,7 @@ class BattleScene {
     this.tip = null;
     this.result = null;
     this.rewardInfo = null;
+    this.showChar = false;   // 按 C 查看人物信息（打开时整个战斗冻结）
     this.hitStop = 0;
   }
 
@@ -4596,10 +4894,14 @@ class BattleScene {
     this.reset();
     this.game.paused = false;
     this.training = !!args.training;
+    this.spar = !!args.spar;     // 演武：对手是「会还手的机关木人」，而不是死木桩
     this.theme = args.theme || { wall: '#2c2b26', floor: '#3a3630', accent: '#6f8f5c' };
     this.tier = args.tier || 1;
     this.onEnd = args.onEnd || null;
-    this.enemyDef = this.training ? DUMMY_ENEMY : getEnemy(args.enemyId);
+    // 演武场的两种木人：死桩（∞ 血、只挨打）与机关木人（血有限、会出手）
+    this.enemyDef = this.training
+      ? (this.spar ? SPAR_DUMMY : DUMMY_ENEMY)
+      : getEnemy(args.enemyId);
 
     // ---- 时间轴 ----
     // state: advancing 轴推进 | awaiting 轮到我方（冻结） | myPerform 我方演出（冻结） | enemyPerform 敌方演出（冻结）
@@ -4613,6 +4915,7 @@ class BattleScene {
     this.enemyAt = 0;            // 敌人本次演出开始的时间轴时刻
     this.enemyBarFrom = 0;       // 敌方「过去的行动」那条的起点（最近一次出手时刻）
     this.enemyBarName = null;    // 该次出手的招式名
+    this.enemyBarKind = null;    // 该次出手的类型（defend 要在轴上换配色）
     this.enemyHasActed = false;  // 是否已经出手过至少一次
     this.enemyVs = null;         // 敌人出手时，我方正处于哪一段（决定闪避/格挡是否成立）
 
@@ -4626,6 +4929,9 @@ class BattleScene {
       qi: this.training ? P.maxQi : clamp(P.qi == null ? P.maxQi : P.qi, 0, P.maxQi),
       maxStam: P.maxStamina,
       stam: P.maxStamina,
+      // 剑意是跨战斗资源：进场沿用存档值，演武场照常带入（能不能攒见 gainIntent）
+      maxIntent: INTENT.max,
+      intent: clamp(P.intent == null ? 0 : P.intent, 0, INTENT.max),
       x: P_X,
       lunge: 0,
       facing: 1,
@@ -4653,7 +4959,9 @@ class BattleScene {
       facing: -1,
       hitQueue: [],
       hitFlash: 0,
-      guarding: false,      // 正在防御（玩家伤害被削弱）
+      // 防御是一段「轴上的窗口」而不是演出状态：从它出手那一刻起盖到下一次出手。
+      // 演出不入轴、玩家也不可能在演出里出招，所以减伤必须挂在轴上才可能被撞上
+      guardUntil: -Infinity,   // 窗口的截止时刻（绝对时刻）
       guardMul: 1,
       restHeal: 0,
       dead: false,
@@ -4666,7 +4974,8 @@ class BattleScene {
     this.phaseTimer = 1.15;
     this.introT = 0;
 
-    this.ensureEnemyQueue(4, rand(0.5, 1.0));
+    // 开局第一击提前：开场就要面对出手，没有白打的空档
+    this.ensureEnemyQueue(4, rand(0.28, 0.55));
   }
 
   get P() { return this.game.player; }
@@ -4690,9 +4999,7 @@ class BattleScene {
 
   enemyInterval() {
     const iv = this.e.def.interval || [2, 3];
-    // interval 原意是两次出手的间隔，但现在的模型里「表演」已单独占用一段
-    // 真实时间，故只取其中一部分作为轴上间隔
-    return rand(iv[0], iv[1]) * 0.42;
+    return rand(iv[0], iv[1]) * INTERVAL_SCALE;
   }
 
   /** 预先排定若干次敌人行动，队列排满为止（供轴上显示未来的行动） */
@@ -4750,6 +5057,7 @@ class BattleScene {
     // 表演期间轴上依然在，不会消失
     this.enemyBarFrom = plan.at;
     this.enemyBarName = plan.move.name;
+    this.enemyBarKind = plan.kind;
     this.enemyHasActed = true;
     // 立刻把队列补回两条：否则表演期间队列只剩一条，
     // 轴上「将要的行动」那条会整段消失，演完才重新出现
@@ -4781,9 +5089,12 @@ class BattleScene {
     }
     // defend 无结算，纯粹是一段「玩家打不痛」的窗口
 
-    // 防御期间玩家的伤害被削弱
-    this.e.guarding = plan.kind === 'defend';
-    this.e.guardMul = mv.guardMul == null ? 0.4 : mv.guardMul;
+    // 防御窗口 = [它出手那一刻, 它下一次出手)。轴上的「过去的行动」那条画的就是这一段，
+    // 窗口与它严格一致，玩家看条就知道这段时间硬拼不划算。
+    if (plan.kind === 'defend') {
+      this.e.guardUntil = this.enemyQueue.length ? this.enemyQueue[0].at : plan.at + 0.8;
+      this.e.guardMul = mv.guardMul == null ? 0.4 : mv.guardMul;
+    }
 
     this.state = 'enemyPerform';
     this.e.swing = 0;
@@ -4794,7 +5105,6 @@ class BattleScene {
     const perf = this.enemyPerf;
     const e = this.e;
     e.swing = 0;
-    e.guarding = false;
     e.hitQueue.length = 0;
     this.enemyPerf = null;
     this.enemyVs = null;
@@ -4805,6 +5115,16 @@ class BattleScene {
 
   // ==================== 更新 ====================
   update(dt) {
+    // 人物信息面板打开时整个战斗冻结：时间轴、演出、资源、特效一概不推进，
+    // 否则玩家看信息时会被继续推进的敌人打死
+    if (this.showChar) {
+      if (justPressed('KeyC') || justPressed('KeyI') || justPressed('Escape')) {
+        this.showChar = false;
+        sfx.ui();
+      }
+      return;
+    }
+
     if (this.hitStop > 0) {
       this.hitStop -= dt;
       dt *= 0.15;
@@ -4980,6 +5300,13 @@ class BattleScene {
 
     if (justPressed('Escape')) { this.tryFlee(); return; }
 
+    // 随时可查人物信息（C / I），不占用行动、不影响时间轴
+    if (justPressed('KeyC') || justPressed('KeyI')) {
+      this.showChar = true;
+      sfx.ui();
+      return;
+    }
+
     // 只有轮到我方时才接受指令；此后一切交给时间轴
     if (awaiting) {
       if (justPressed('KeyJ')) { this.tryMove('light'); return; }
@@ -4999,14 +5326,14 @@ class BattleScene {
     const p = this.p;
     if (this.state !== 'awaiting') return;
 
-    const seq = p.seq.concat([moveId]);
+    const seq = p.seq.concat([seqStep(moveId)]);
     const skill = matchSkill(seq);
 
     if (skill && this.P.hasSkill(skill.id)) {
       if (p.qi >= skill.qi) { this.castSkill(skill); return; }
       this.flashTip(`内力不足，连招中断（需 ${skill.qi}）`);
       sfx.fail();
-      this.baseMove(moveId, [moveId]);
+      this.baseMove(moveId, [seqStep(moveId)]);
       return;
     }
     this.baseMove(moveId, seq);
@@ -5055,6 +5382,7 @@ class BattleScene {
     p.stam -= mv.stamina;
     p.seq = seq.slice();
     p.seqSetAt = this.now;
+    this.gainIntent(INTENT.perBase);
 
     this.beginMyAction({
       kind: 'attack',
@@ -5087,8 +5415,11 @@ class BattleScene {
   castSkill(skill) {
     const p = this.p;
     p.qi -= skill.qi;
-    p.seq = [];
-    p.seqSetAt = -999;
+    // 原序列清空；若这招本身相当于一个基础招式（风卷残云算「轻」、白虹贯日算「重」），
+    // 就作为一项接进新序列，让连招能一路滚下去（轻轻轻→风卷残云→再按两下轻→…）
+    p.seq = seqAfterSkill(skill);
+    p.seqSetAt = p.seq.length ? this.now : -999;
+    this.gainIntent(INTENT.perSkill);
 
     const per = skill.steps.length ? this.skillWeaponBonus / skill.steps.length : 0;
     this.beginMyAction({
@@ -5106,16 +5437,31 @@ class BattleScene {
     sfx.skill();
   }
 
+  /**
+   * 剑意累积：出招（基础招与连招）都会长剑意，攒满才能放绝学。
+   * 生命周期是「一次秘境探索」：场内（含演武）随便攒，离开秘境或演武结束就归零。
+   */
+  gainIntent(n) {
+    const p = this.p;
+    if (n <= 0 || p.intent >= p.maxIntent) return;
+    p.intent = Math.min(p.maxIntent, p.intent + n);
+    if (p.intent >= p.maxIntent) {
+      this.flashTip('剑意已满 · 按 U 出无明剑意');
+      sfx.parry();
+    }
+  }
+
   doUltimate() {
     const p = this.p;
     if (this.state !== 'awaiting') return;
-    if (p.qi < ULTIMATE.minQi) {
-      this.flashTip(`内力不足（需 ${ULTIMATE.minQi}）`);
+    if (p.intent < ULTIMATE.intentCost) {
+      this.flashTip(`剑意未满（${Math.floor(p.intent)} / ${ULTIMATE.intentCost}）`);
       sfx.fail();
       return;
     }
-    const spent = p.qi;
-    p.qi = 0;
+    // 伤害由剑意换算而来（不与内力挂钩），放完清零
+    const spent = p.intent;
+    p.intent = 0;
     p.seq = [];
     p.seqSetAt = -999;
 
@@ -5128,7 +5474,7 @@ class BattleScene {
       steps: [{
         delay: ULTIMATE.delay,
         step: {
-          dmg: spent * ULTIMATE.perQi * this.P.attackMul,
+          dmg: spent * ULTIMATE.dmgPerIntent * this.P.attackMul,
           reach: ULTIMATE.reach, arc: 240, fx: 'ultimate',
           tint: ULTIMATE.tint,
           pierce: true, breakGuard: true, knockback: 70, screenShake: 16,
@@ -5169,6 +5515,10 @@ class BattleScene {
     if (this.state !== 'awaiting') return;
     if (p.stam < GUARD.stamina) { this.flashTip('体力不济，可先「让招」(S) 回气'); sfx.fail(); return; }
     p.stam -= GUARD.stamina;
+    // 格挡打断连招：举剑架招，先前攒下的序列就此作废（不额外提示，看序列即可）
+    p.seq = [];
+    p.seqSetAt = -999;
+    this.flashTip('格挡');
     this.beginMyAction({
       kind: 'guard',
       perform: GUARD.perform,
@@ -5182,6 +5532,10 @@ class BattleScene {
   /** 让招：不出招，只把时间轴往前放一段，用来调整出手节奏（不耗体，总是可用） */
   doWait() {
     if (this.state !== 'awaiting') return;
+    const p = this.p;
+    // 与格挡一样打断连招：收手让招，先前攒下的序列就此作废（不额外提示，看序列即可）
+    p.seq = [];
+    p.seqSetAt = -999;
     this.flashTip('让招 · 静观其变');
     this.beginMyAction({
       kind: 'wait',
@@ -5226,7 +5580,16 @@ class BattleScene {
     const e = this.e;
     if (e.dead) return;
 
-    if (this.training) {
+    // 命中回气：基础招式按招式表，连招每段固定 3 点。
+    // 放在演武场分支之前——否则打木人桩不回气，就没法在那里练连招。
+    if (st.isBase && st.qiGain) {
+      p.qi = Math.min(p.maxQi, p.qi + st.qiGain);
+    } else if (!st.isBase) {
+      p.qi = Math.min(p.maxQi, p.qi + 3);
+    }
+
+    // 死木桩只是挨打的靶子：伤害取简化数值、不扣血。机关木人走正常结算，能被打空
+    if (this.training && e.def.dummy) {
       this.spawnFloater(e.x, GROUND_Y - 96, Math.round(st.dmg), '#ffffff', 17);
       this.bumpCombo();
       this.spawnHit(e.x, GROUND_Y - 50, st.tint, 0.7);
@@ -5237,8 +5600,8 @@ class BattleScene {
 
     const pierce = st.pierce ? 0.5 : 1;
     let real = Math.max(1, st.dmg - e.def.def * 0.6 * pierce);
-    // 敌人正在防御：伤害被大幅削弱，这是它「歇一口气」的窗口
-    if (e.guarding) {
+    // 敌人正在防御（轴上的那段窗口内）：伤害被大幅削弱，这是它「歇一口气」的时间
+    if (this.now < e.guardUntil) {
       real *= e.guardMul;
       this.spawnFloater(e.x + rand(-10, 10), GROUND_Y - 118, '挡', '#a9b4c0', 17);
     }
@@ -5247,8 +5610,9 @@ class BattleScene {
     this.bumpCombo();
 
     const big = real > 26;
+    // 只写伤害数值：连击数改用「N 连」跟在后面，避免被误读成伤害倍率
     this.spawnFloater(e.x + rand(-8, 8), GROUND_Y - 96 - rand(0, 12),
-      Math.round(real) + (p.combo > 4 ? ` x${p.combo}` : ''),
+      `${Math.round(real)}${p.combo > 4 ? `　${p.combo} 连` : ''}`,
       big ? '#ffcf5c' : '#ffffff', big ? 22 : 17);
     this.spawnHit(e.x, GROUND_Y - 50, st.tint, big ? 1.35 : 0.85);
     this.shake(big ? 7 : 3, big ? 0.2 : 0.11);
@@ -5267,12 +5631,6 @@ class BattleScene {
       this.state = 'advancing';
     }
     if (st.screenShake) this.shake(st.screenShake, 0.35);
-
-    if (st.isBase && st.qiGain) {
-      p.qi = Math.min(p.maxQi, p.qi + st.qiGain);
-    } else if (!st.isBase) {
-      p.qi = Math.min(p.maxQi, p.qi + 3);
-    }
 
     if (e.hp <= 0) this.killEnemy();
   }
@@ -5331,6 +5689,8 @@ class BattleScene {
     sfx.hurt();
     if (p.hp <= 0) {
       p.hp = 0;
+      // 演武场里被打空不算败：不记死亡、不丢进度，只收场
+      if (this.training) { this.flashTip('气血耗尽 · 演武收场'); this.endBattle('flee'); return; }
       this.endBattle('defeat');
     }
   }
@@ -5340,6 +5700,7 @@ class BattleScene {
     e.hp = 0;
     e.dead = true;
     e.hitQueue.length = 0;
+    e.guardUntil = -Infinity;
     this.enemyPerf = null;
     this.enemyQueue.length = 0;
     sfx.die();
@@ -5392,9 +5753,13 @@ class BattleScene {
     if (!this.training) {
       P.hp = clamp(this.p.hp, 1, P.maxHp);
       P.qi = this.p.qi;
+      // 剑意在同一次秘境探索的战斗之间保留，带回副本场景
+      P.intent = clamp(this.p.intent, 0, P.maxIntent);
     } else {
       P.hp = P.maxHp;
       P.qi = P.maxQi;
+      // 演武攒下的剑意不带出去（秘境外一律为零）
+      P.intent = 0;
     }
     this.game.save();
     const cb = this.onEnd;
@@ -5465,8 +5830,24 @@ class BattleScene {
 
   // ==================== 渲染 ====================
   render(ctx) {
-    const t = this.theme;
+    this.renderWorld(ctx);
+    this.renderOverlay(ctx);
+    // 人物面板永远画在最上层
+    if (this.showChar) {
+      renderCharPanel(ctx, this.game.W, this.game.H, this.P, {
+        hp: this.p.hp, maxHp: this.p.maxHp,
+        qi: this.p.qi, maxQi: this.p.maxQi,
+        stam: this.p.stam, maxStam: this.p.maxStam,
+        intent: this.p.intent, maxIntent: this.p.maxIntent,
+        tip: this.p.intent >= this.p.maxIntent ? '剑意已满 —— 按 U 出「无明剑意」'
+          : this.training ? '演武中攒下的剑意，一出演武场即散'
+            : '剑意随本次秘境探索而生灭，出秘境即散',
+      });
+    }
+  }
 
+  renderWorld(ctx) {
+    const t = this.theme;
     const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
     g.addColorStop(0, '#12100e');
     g.addColorStop(0.55, t.wall || '#2c2b26');
@@ -5513,8 +5894,6 @@ class BattleScene {
       ctx.fillStyle = vg;
       ctx.fillRect(0, 0, this.game.W, this.game.H);
     }
-
-    this.renderOverlay(ctx);
   }
 
   renderBackdrop(ctx) {
@@ -5639,11 +6018,13 @@ class BattleScene {
     });
     ctx.restore();
 
-    // 敌人演出中的提示：攻击给红色起手警示，防御/歇息给柔和标示
+    // 敌人演出中的提示：攻击给红色起手警示，防御/歇息给柔和标示。
+    // 防御的标示要盖满轴上的整段（不只表演那一下），玩家才知道何时不该硬拼
     const perf = this.enemyPerf;
-    if (perf && !e.dead && this.phase === 'fight') {
+    const guarding = this.now < e.guardUntil;
+    if ((perf || guarding) && !e.dead && this.phase === 'fight') {
       const bob = Math.sin(this.game.time * 18) * 3;
-      if (perf.kind === 'attack') {
+      if (perf && perf.kind === 'attack') {
         if (perf.t < perf.strikeAt) {
           const k = clamp(perf.t / Math.max(0.01, perf.strikeAt), 0, 1);
           ctx.save();
@@ -5664,7 +6045,7 @@ class BattleScene {
         }
       } else {
         // 防御 / 歇息：提示这是可以调整节奏的窗口
-        const isGuard = perf.kind === 'defend';
+        const isGuard = guarding;
         const col = isGuard ? '#a9b4c0' : '#7ce08a';
         ctx.save();
         ctx.globalAlpha = 0.4;
@@ -5815,7 +6196,9 @@ class BattleScene {
       size: boss ? 20 : 17, color: boss ? '#e05c4a' : PAL.paper, outline: 3,
     });
 
-    const hpRatio = this.training ? 1 : clamp(e.hp / e.maxHp, 0, 1);
+    // 只有死木桩显示 ∞：机关木人的血是有限的，打空即收场
+    const infiniteHp = this.training && e.def.dummy;
+    const hpRatio = infiniteHp ? 1 : clamp(e.hp / e.maxHp, 0, 1);
     ctx.fillStyle = 'rgba(0,0,0,0.62)';
     ctx.fillRect(bx - 2, by - 2, bw + 4, 14);
     const hg = ctx.createLinearGradient(bx, by, bx, by + 10);
@@ -5827,7 +6210,7 @@ class BattleScene {
     ctx.lineWidth = 1;
     ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, 9);
 
-    text(ctx, this.training ? '∞' : `${Math.ceil(e.hp)} / ${e.maxHp}`, bx + bw / 2, by + 5, {
+    text(ctx, infiniteHp ? '∞' : `${Math.ceil(e.hp)} / ${e.maxHp}`, bx + bw / 2, by + 5, {
       size: 11, align: 'center', baseline: 'middle', color: '#fff',
     });
     if (!this.training) {
@@ -5890,16 +6273,37 @@ class BattleScene {
       size: 9.5, align: 'center', baseline: 'middle', color: 'rgba(255,255,255,0.92)',
     });
 
+    // 剑意：攒满才能按 U 出无明剑意，所以满了要显眼
+    const full = p.intent >= p.maxIntent;
+    const pulse = full ? 0.72 + Math.sin(this.game.time * 7) * 0.28 : 1;
+    ctx.save();
+    ctx.globalAlpha = pulse;
+    bar(ctx, x + 14, y + 76, barW, 10, p.intent / p.maxIntent, ULTIMATE.tint, {
+      r: 2,
+      border: full ? 'rgba(233,214,255,0.95)' : 'rgba(0,0,0,0.55)',
+    });
+    ctx.restore();
+    text(ctx, full ? `剑意已满 · ${Math.floor(p.intent)}（按 U）` : `剑意 ${Math.floor(p.intent)} / ${p.maxIntent}`,
+      x + 14 + barW / 2, y + 81, {
+        size: 9.5, align: 'center', baseline: 'middle',
+        color: full ? '#1a1220' : 'rgba(255,255,255,0.92)',
+        weight: full ? 700 : 400,
+      });
+
     const jin = this.P.itemCount('jinchuang');
     const xing = this.P.itemCount('xingqi');
-    text(ctx, `[1] 药 ×${jin}`, x + 14, y + 88, { size: 11, color: jin > 0 ? PAL.jadeHi : '#584f40' });
-    text(ctx, `[2] 散 ×${xing}`, x + 92, y + 88, { size: 11, color: xing > 0 ? PAL.azure : '#584f40' });
+    text(ctx, `[1] 药 ×${jin}`, x + 14, y + 100, { size: 11, color: jin > 0 ? PAL.jadeHi : '#584f40' });
+    text(ctx, `[2] 散 ×${xing}`, x + 92, y + 100, { size: 11, color: xing > 0 ? PAL.azure : '#584f40' });
+    // 让人知道战斗中随时能查人物（打开时战斗冻结，看信息不吃亏）
+    text(ctx, '[C] 人物', x + w - 14, y + 100, {
+      size: 11, align: 'right', color: PAL.paperFaint,
+    });
 
     if (p.combo > 1) {
       const k = clamp((this.now - p.comboSetAt) / 2.4, 0, 1);
       ctx.save();
       ctx.globalAlpha = 0.5 + (1 - k) * 0.5;
-      strokeText(ctx, `${p.combo} 连`, x + w - 40, y + 92, {
+      strokeText(ctx, `${p.combo} 连`, x + w - 40, y + 110, {
         size: 19, color: p.combo > 9 ? '#ffcf5c' : '#e9dfe8', outline: 3,
       });
       ctx.restore();
@@ -5931,20 +6335,26 @@ class BattleScene {
     if (p.seq.length === 0) {
       text(ctx, '—', x + 4, y + 54, { size: 18, color: '#4d4638' });
     } else {
-      p.seq.forEach((m, i) => {
-        const isHeavy = m === 'heavy';
+      p.seq.forEach((step, i) => {
+        const isHeavy = stepMove(step) === 'heavy';
+        // 由招式接续而来的那一项：写招式名而不是「轻/重」，底部色条标出它算哪一类
+        const sk = step.via ? SKILLS.find((s) => s.id === step.via) : null;
         const bx = x + i * (NS + gap);
         const by = y + 34;
         roundRectPath(ctx, bx, by, NS, NS, 4);
         ctx.fillStyle = isHeavy ? 'rgba(80,58,20,0.92)' : 'rgba(40,36,28,0.92)';
         ctx.fill();
-        ctx.strokeStyle = isHeavy ? PAL.gold : PAL.paper;
-        ctx.lineWidth = isHeavy ? 2 : 1.4;
+        ctx.strokeStyle = sk ? sk.tint : isHeavy ? PAL.gold : PAL.paper;
+        ctx.lineWidth = isHeavy || sk ? 2 : 1.4;
         ctx.stroke();
-        text(ctx, isHeavy ? '重' : '轻', bx + NS / 2, by + NS / 2 + 1, {
-          size: 13, weight: 700, align: 'center', baseline: 'middle',
-          color: isHeavy ? PAL.gold : PAL.paper,
+        const label = sk ? sk.name.slice(0, 2) : isHeavy ? '重' : '轻';
+        let size = 13;
+        while (size > 9 && measure(ctx, label, size, 700) > NS - 4) size--;
+        text(ctx, label, bx + NS / 2, by + NS / 2 + (sk ? 0 : 1), {
+          size, weight: 700, align: 'center', baseline: 'middle',
+          color: sk ? sk.tint : isHeavy ? PAL.gold : PAL.paper,
         });
+        if (sk) fillRect(ctx, bx + 3, by + NS - 4, NS - 6, 2, isHeavy ? PAL.gold : PAL.paper);
       });
       const life = clamp(1 - (this.now - p.seqSetAt) / SEQ_WINDOW, 0, 1);
       fillRect(ctx, x, y + 66, w - 22, 2, 'rgba(255,255,255,0.08)');
@@ -5963,7 +6373,7 @@ class BattleScene {
       const sk = SKILLS.find((s) => s.id === sid);
       if (!sk || sk.pattern.length <= seq.length) continue;
       let pre = true;
-      for (let i = 0; i < seq.length; i++) if (sk.pattern[i] !== seq[i]) { pre = false; break; }
+      for (let i = 0; i < seq.length; i++) if (sk.pattern[i] !== stepMove(seq[i])) { pre = false; break; }
       if (pre) next.push({ sk, need: sk.pattern.slice(seq.length) });
     }
     if (!next.length) return seq.length ? { text: '无后续招式', color: '#584f40' } : null;
@@ -6043,20 +6453,25 @@ class BattleScene {
 
     const eQ = this.enemyQueue;
 
-    const enemySeg = (from, to, name, isPast) => {
+    // 防御段单独配色：它代表「这段时间打它不痛」，与普通攻击段区分开
+    const enemySeg = (from, to, name, isPast, kind) => {
       const l = Math.max(toPx(from), trackL);
       const r = Math.min(toPx(to), trackR);
       if (r - l <= 1) return;
 
+      const defend = kind === 'defend';
+      const fillCol = defend ? '#5a6a78' : '#b0453a';
+      const lineCol = defend ? '#a9b4c0' : '#e05c4a';
+
       roundRectPath(ctx, l, eBarY, r - l, barH, 3);
-      ctx.fillStyle = isPast ? this.hexA('#b0453a', 0.15) : this.hexA('#b0453a', 0.30);
+      ctx.fillStyle = this.hexA(fillCol, isPast ? 0.15 : 0.30);
       ctx.fill();
-      ctx.strokeStyle = isPast ? this.hexA('#e05c4a', 0.34) : this.hexA('#e05c4a', 0.58);
+      ctx.strokeStyle = this.hexA(lineCol, isPast ? 0.34 : 0.58);
       ctx.lineWidth = 1;
       ctx.stroke();
 
       // 两端各标一次「出手时刻」
-      ctx.fillStyle = this.hexA('#ff8566', isPast ? 0.48 : 0.95);
+      ctx.fillStyle = this.hexA(defend ? '#c8d4dc' : '#ff8566', isPast ? 0.48 : 0.95);
       const sl = Math.max(toPx(from), trackL);
       const sr = Math.min(toPx(from) + 4, trackR);
       if (sr > sl) ctx.fillRect(sl, eBarY, sr - sl, barH);
@@ -6064,8 +6479,10 @@ class BattleScene {
       if (er >= trackL && er <= trackR) ctx.fillRect(er - 2, eBarY, 4, barH);
 
       const dur = to - from;
-      const label = `${name || '行动'} ${dur.toFixed(1)}s`;
-      const tcol = isPast ? 'rgba(255,186,166,0.62)' : 'rgba(255,208,196,0.92)';
+      const label = `${defend ? '守 · ' : ''}${name || '行动'} ${dur.toFixed(1)}s`;
+      const tcol = defend
+        ? (isPast ? 'rgba(190,206,218,0.62)' : 'rgba(212,226,236,0.94)')
+        : (isPast ? 'rgba(255,186,166,0.62)' : 'rgba(255,208,196,0.92)');
       if (r - l > measure(ctx, label, 10.5, 700) + 10) {
         text(ctx, label, (l + r) / 2, eBarY + barH / 2, {
           size: 10.5, weight: 700, align: 'center', baseline: 'middle', color: tcol,
@@ -6080,11 +6497,11 @@ class BattleScene {
     if (!this.e.dead) {
       // 过去的行动：最近一次已发生的出手，从它出手那一刻起算它的 cd
       if (this.enemyHasActed && eQ.length) {
-        enemySeg(this.enemyBarFrom, eQ[0].at, this.enemyBarName, true);
+        enemySeg(this.enemyBarFrom, eQ[0].at, this.enemyBarName, true, this.enemyBarKind);
       }
       // 将要的行动：队列里的下一次出手，同样从它出手那一刻起算它的 cd
       if (eQ.length >= 2) {
-        enemySeg(eQ[0].at, eQ[1].at, eQ[0].move.name, false);
+        enemySeg(eQ[0].at, eQ[1].at, eQ[0].move.name, false, eQ[0].kind);
       }
     }
 
@@ -6145,26 +6562,31 @@ class BattleScene {
     // ---- 我方候选：下箭头标出「选它的话，时间会推进到哪一刻」----
     if (awaiting) {
       const spd = this.P.speedMul;
+      // 候选分两排：防御（闪避／格挡）在上、基础招式（轻／重）在下。
+      // 同排两项的落点天然隔得开（闪避 0.30 vs 格挡 0.50、轻 0.36 vs 重 0.60），
+      // 两排正好把四个标签装下；若因轴段或缩放改动挤住，会顺延到下一排兜底，不至于叠字
       const items = [
-        { name: '轻', axis: BASE_MOVES.light.cd, cost: BASE_MOVES.light.stamina, tint: '#e9dfc8' },
-        { name: '重', axis: BASE_MOVES.heavy.cd, cost: BASE_MOVES.heavy.stamina, tint: '#d4a24c' },
-        { name: '闪避', axis: EVADE.axis, cost: EVADE.stamina, tint: EVADE.tint },
-        { name: '格挡', axis: GUARD.axis, cost: GUARD.stamina, tint: GUARD.tint },
+        { name: '轻', axis: BASE_MOVES.light.cd, cost: BASE_MOVES.light.stamina, tint: '#e9dfc8', row: 0 },
+        { name: '重', axis: BASE_MOVES.heavy.cd, cost: BASE_MOVES.heavy.stamina, tint: '#d4a24c', row: 0 },
+        { name: '闪避', axis: EVADE.axis, cost: EVADE.stamina, tint: EVADE.tint, row: 1 },
+        { name: '格挡', axis: GUARD.axis, cost: GUARD.stamina, tint: GUARD.tint, row: 1 },
       ].map((it) => ({ ...it, x: x0 + it.axis * spd * scale }));
 
-      // 位置接近的标记错开行，避免文字互相压住
-      const sorted = items.slice().sort((a, b) => a.x - b.x);
-      const rowEnds = [];
-      for (const it of sorted) {
-        const wNeed = measure(ctx, it.name, 10.5, 700) + 10;
-        let row = 0;
-        while (row < rowEnds.length && it.x - wNeed / 2 < rowEnds[row]) row++;
-        if (row >= rowEnds.length) rowEnds.push(0);
-        rowEnds[row] = it.x + wNeed / 2;
+      // 同排两项的最小留白。身法越高同排间距越窄（轴段差 × spd × scale），留白取小些
+      const LABEL_GAP = 3;
+      const rowEnds = [-Infinity, -Infinity];
+      const order = items.slice().sort((a, b) => (a.row - b.row) || (a.x - b.x));
+      for (const it of order) {
+        const half = measure(ctx, it.name, 10.5, 700) / 2;
+        let row = it.row;
+        while (row < rowEnds.length && it.x - half < rowEnds[row] + LABEL_GAP) row++;
+        if (row >= rowEnds.length) rowEnds.push(-Infinity);
+        rowEnds[row] = it.x + half;
         it.row = row;
       }
 
-      const rowHgt = 12;
+      // 排距取 15：字号 10.5 时两排之间留出约 4.5px 空隙，再小就贴在一起了
+      const rowHgt = 15;
       const baseY = axisY - 7;
       for (const it of items) {
         const ok = p.stam >= it.cost;
@@ -6176,9 +6598,10 @@ class BattleScene {
           color: ok ? 'rgba(233,223,200,0.9)' : 'rgba(190,130,120,0.7)',
         });
 
-        // 下箭头：从标签下方指向轴上的时刻
+        // 下箭头：从标签下方穿过时间轴**与我方整条行动条**，尖端落在两方行动条之间——
+        // 竖线所在就是落点，不必在两条之间来回对位
         const top = labelY + 2;
-        const bot = axisY - 1;
+        const bot = (myBarY + barH + eBarY) / 2;
         if (bot > top) {
           ctx.save();
           ctx.strokeStyle = col;
@@ -6294,7 +6717,7 @@ class BattleScene {
         size: 13, align: 'center', color: '#8a6a2f',
       });
     } else if (this.phase === 'flee') {
-      text(ctx, '你退出了战斗。', W / 2, H / 2 - 10, {
+      text(ctx, this.training ? '演武到此为止，回镇调息。' : '你退出了战斗。', W / 2, H / 2 - 10, {
         size: 14, align: 'center', color: PAL.paperDim,
       });
     }
