@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<!-- 开发版外壳（打包模板）。外链样式与模块入口，因为 ES Module 不能从 file:// 加载，
+     本文件必须经 http 打开。想要能双击运行的版本，请用 index.html —— 它由本文件打包生成：
+         node tools/build_standalone.mjs -->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>无明剑 · 武侠肉鸽</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <canvas id="game" width="960" height="540"></canvas>
+  </div>
+  <div id="boot">
+    <div class="boot-title">无 明 剑</div>
+    <div class="boot-sub">正在起剑…</div>
+  </div>
+  <script>
+    // 启动诊断。ES Module 脚本加载失败**不会冒泡到 window 的 error 事件**，
+    // 只能在捕获阶段拿到，否则页面会静默卡在「正在起剑」，看不出任何原因。
+    // 开发版走的就是模块加载，直接双击本文件必然触发；打包版是内联脚本，不会走到这里。
+    (function () {
+      function fail(title, detail) {
+        var b = document.getElementById('boot');
+        if (!b || !document.body.contains(b)) return;
+        b.style.display = 'flex';
+        b.style.opacity = '1';
+        b.innerHTML = '<div class="boot-title" style="color:#e05c4a">' + title + '</div>' +
+          '<div class="boot-sub" style="max-width:680px;white-space:pre-wrap;text-align:left;' +
+          'font-size:13px;line-height:1.7">' + detail + '</div>';
+      }
+
+      var isFile = location.protocol === 'file:';
+      var FILE_HINT = isFile
+        ? '这是开发版（源码拆成多个模块），file:// 下浏览器会把 ES Module 当作跨源请求拦掉。\n' +
+          '两种解决方式，任选其一：\n' +
+          '  · 想玩 → 双击 index.html（打包版，单个文件，免服务器）\n' +
+          '  · 想改代码 → 起本地服务器，访问 http://127.0.0.1:8123/'
+        : '请打开开发者工具的 Console 查看具体报错。';
+
+      window.addEventListener('error', function (e) {
+        var t = e.target;
+        if (t && t !== window && t.tagName && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) {
+          fail('启动失败', '无法加载：' + (t.src || t.href || '(未知)') + '\n\n' + FILE_HINT);
+        } else {
+          fail('运行出错', String(e.message || e) + '\n' +
+            String(e.filename || '') + ':' + (e.lineno || 0));
+        }
+      }, true);
+
+      // 兜底：连错误事件都没收到时（例如被静默拦截），靠「入口是否跑过」判断
+      window.addEventListener('load', function () {
+        setTimeout(function () {
+          if (!window.__wuming) fail('启动失败', '脚本未能执行。\n\n' + FILE_HINT);
+        }, 500);
+      });
+    })();
+  </script>
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
