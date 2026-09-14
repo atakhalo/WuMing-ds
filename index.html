@@ -6361,26 +6361,31 @@ class BattleScene {
       fillRect(ctx, x, y + 66, (w - 22) * life, 2, 'rgba(212,162,76,0.5)');
     }
 
-    const hint = this.nextHint();
-    if (hint) text(ctx, hint.text, x, y + 94, { size: 11, color: hint.color });
+    // 连招提示：接「轻」「重」各自会触发哪一招（这一按成不了招的那一边就不列）
+    let hy = y + 94;
+    for (const h of this.comboHints()) {
+      text(ctx, `${h.label}→${h.skill.name}`, x, hy, {
+        size: 11, color: h.ok ? PAL.jadeHi : '#8a6a2f',
+      });
+      hy += 15;
+    }
   }
 
-  nextHint() {
+  /**
+   * 连招提示：接「轻」「重」各自会触发哪一招。
+   * 只有「这一按确实成招」——序列后缀匹配到招式、且玩家已学会——才列出；
+   * 比如已有两个轻时，接轻是风卷残云、接重是白虹贯日，接不出的那一边就不显示。
+   * 内力不足时照常列出、只把颜色压暗，免得玩家以为这串序列没有了后续。
+   */
+  comboHints() {
     const p = this.p;
-    const seq = p.seq;
-    const next = [];
-    for (const sid of this.P.skills) {
-      const sk = SKILLS.find((s) => s.id === sid);
-      if (!sk || sk.pattern.length <= seq.length) continue;
-      let pre = true;
-      for (let i = 0; i < seq.length; i++) if (sk.pattern[i] !== stepMove(seq[i])) { pre = false; break; }
-      if (pre) next.push({ sk, need: sk.pattern.slice(seq.length) });
+    const out = [];
+    for (const [moveId, label] of [['light', '轻'], ['heavy', '重']]) {
+      const sk = matchSkill(p.seq.concat([seqStep(moveId)]));
+      if (!sk || !this.P.hasSkill(sk.id)) continue;
+      out.push({ label, skill: sk, ok: p.qi >= sk.qi });
     }
-    if (!next.length) return seq.length ? { text: '无后续招式', color: '#584f40' } : null;
-    next.sort((a, b) => a.need.length - b.need.length);
-    const t = next[0];
-    const label = t.need.map((m) => (m === 'light' ? '轻' : '重')).join('·');
-    return { text: `再按【${label}】`, color: p.qi >= t.sk.qi ? PAL.jadeHi : '#8a6a2f' };
+    return out;
   }
 
   /**
@@ -6562,14 +6567,29 @@ class BattleScene {
     // ---- 我方候选：下箭头标出「选它的话，时间会推进到哪一刻」----
     if (awaiting) {
       const spd = this.P.speedMul;
-      // 候选分两排：防御（闪避／格挡）在上、基础招式（轻／重）在下。
+      // 轻／重两候选：这一按若会**触发连招**（序列后缀成招 + 已学会 + 内力够），
+      // 落点用连招的 cd，而不是基础招式的固定 cd——否则箭头指的时刻跟按下后时间轴
+      // 真正会走到哪一步对不上，读轴就读错了。标签仍只写「轻」「重」，不写招式名。
+      const moveCand = (moveId, label) => {
+        const mv = BASE_MOVES[moveId];
+        const sk = matchSkill(p.seq.concat([seqStep(moveId)]));
+        const cast = sk && this.P.hasSkill(sk.id) && p.qi >= sk.qi;
+        return {
+          name: label,
+          axis: cast ? sk.cd : mv.cd,
+          ok: cast ? true : p.stam >= mv.stamina,
+          tint: cast ? sk.tint : mv.tint,
+          row: 0,
+        };
+      };
+      // 候选分两排：防御（闪避／格挡）在上、攻击（轻／重）在下。
       // 同排两项的落点天然隔得开（闪避 0.30 vs 格挡 0.50、轻 0.36 vs 重 0.60），
-      // 两排正好把四个标签装下；若因轴段或缩放改动挤住，会顺延到下一排兜底，不至于叠字
+      // 两排正好把四个标签装下；若因轴段、缩放或连招落点挤住，会顺延到下一排兜底，不至于叠字
       const items = [
-        { name: '轻', axis: BASE_MOVES.light.cd, cost: BASE_MOVES.light.stamina, tint: '#e9dfc8', row: 0 },
-        { name: '重', axis: BASE_MOVES.heavy.cd, cost: BASE_MOVES.heavy.stamina, tint: '#d4a24c', row: 0 },
-        { name: '闪避', axis: EVADE.axis, cost: EVADE.stamina, tint: EVADE.tint, row: 1 },
-        { name: '格挡', axis: GUARD.axis, cost: GUARD.stamina, tint: GUARD.tint, row: 1 },
+        moveCand('light', '轻'),
+        moveCand('heavy', '重'),
+        { name: '闪避', axis: EVADE.axis, ok: p.stam >= EVADE.stamina, tint: EVADE.tint, row: 1 },
+        { name: '格挡', axis: GUARD.axis, ok: p.stam >= GUARD.stamina, tint: GUARD.tint, row: 1 },
       ].map((it) => ({ ...it, x: x0 + it.axis * spd * scale }));
 
       // 同排两项的最小留白。身法越高同排间距越窄（轴段差 × spd × scale），留白取小些
@@ -6589,7 +6609,7 @@ class BattleScene {
       const rowHgt = 15;
       const baseY = axisY - 7;
       for (const it of items) {
-        const ok = p.stam >= it.cost;
+        const ok = it.ok;
         const col = ok ? it.tint : '#8a6a62';
         const labelY = baseY - it.row * rowHgt;
 
