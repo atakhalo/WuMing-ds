@@ -1713,14 +1713,27 @@ export class BattleScene {
         ctx.lineWidth = performing ? 1.5 : 1.2;
         ctx.stroke();
 
-        // 轴段很短时（如撩云式 0.30s）条内放不下名字，就贴到条的右侧写
+        // 名字要写在条内：轴段短（如绝学 0.30s）时先逐档缩字号去凑条宽，
+        // 还差一点就把字形横向压扁（下限 0.7，再扁就不成形了）；
+        // 只有在条窄到怎么都放不下时，才退到条的右侧外——那是最后的兜底，不该是常态
         const label = act.name || '';
-        const lw = measure(ctx, label, 10, 700);
         const tcol = performing ? '#ffffff' : 'rgba(240,230,208,0.9)';
-        if (cr - cl >= lw + 8) {
-          text(ctx, label, cl + 4, myBarY + barH / 2, {
-            size: 10, weight: 700, baseline: 'middle', color: tcol,
+        const avail = cr - cl - 5;
+        let size = 10;
+        while (size > 8 && measure(ctx, label, size, 700) > avail) size -= 0.5;
+        const lw = measure(ctx, label, size, 700);
+        if (lw <= avail) {
+          text(ctx, label, (cl + cr) / 2, myBarY + barH / 2, {
+            size, weight: 700, align: 'center', baseline: 'middle', color: tcol,
           });
+        } else if (avail / lw >= 0.7) {
+          ctx.save();
+          ctx.translate((cl + cr) / 2, myBarY + barH / 2);
+          ctx.scale(avail / lw, 1);
+          text(ctx, label, 0, 0, {
+            size, weight: 700, align: 'center', baseline: 'middle', color: tcol,
+          });
+          ctx.restore();
         } else if (cr + 4 + lw <= trackR) {
           text(ctx, label, cr + 4, myBarY + barH / 2, {
             size: 10, weight: 700, baseline: 'middle', color: tcol,

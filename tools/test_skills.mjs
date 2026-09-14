@@ -427,8 +427,9 @@ console.log('\n=== 8b. 剑意与无明剑意 ===');
   ok(ULTIMATE.intentCost === INTENT.max, `绝学需要满槽（${ULTIMATE.intentCost}）`);
   ok(Number.isFinite(ULTIMATE.dmgPerIntent) && ULTIMATE.dmgPerIntent > 0,
     `剑意换伤害 ${ULTIMATE.dmgPerIntent}／点，满槽约 ${Math.round(ULTIMATE.intentCost * ULTIMATE.dmgPerIntent)} 点伤害`);
-  // cd 缩短过，别被调回去
-  ok(ULTIMATE.cd <= 1.2, `无明剑意轴段 ${ULTIMATE.cd}s（已缩短，原为 1.65s）`);
+  // 轴段缩短过（1.65 → 1.10 → 与闪避同长），别被调回去
+  ok(ULTIMATE.cd === EVADE.axis, `无明剑意轴段 ${ULTIMATE.cd}s，与闪避(${EVADE.axis}s)同长`);
+  ok(ULTIMATE.cd <= 0.40, `无明剑意轴段 ${ULTIMATE.cd}s（已缩短，原为 1.65s）`);
   ok(ULTIMATE.delay <= ULTIMATE.perform, `命中(${ULTIMATE.delay}s)落在演出(${ULTIMATE.perform}s)内`);
   ok(!('minQi' in ULTIMATE) && !('perQi' in ULTIMATE),
     '绝学不再与内力挂钩（门槛已改为剑意，残留字段会误导后来人）');

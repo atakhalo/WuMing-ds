@@ -510,6 +510,7 @@ const INTENT = {
 };
 
 // 绝学：U 键释放，需剑意满，释放后剑意清零。伤害随剑意上限与攻击倍率走
+// 轴段与闪避同长（引用 EVADE.axis）：放完立刻回到读轴，不会因为一剑挥空而长时间脱不出手
 const ULTIMATE = {
   id: 'wuming',
   name: '无明剑意',
@@ -517,7 +518,7 @@ const ULTIMATE = {
   dmgPerIntent: 1.35,
   tint: '#c9a6ff',
   perform: 0.75,
-  cd: 1.10,
+  cd: EVADE.axis,
   delay: 0.50,
   reach: 160,
   desc: '剑意盈满，凝于一剑。每点剑意化为锋芒，出剑后剑意归零。',
@@ -6526,14 +6527,27 @@ class BattleScene {
         ctx.lineWidth = performing ? 1.5 : 1.2;
         ctx.stroke();
 
-        // 轴段很短时（如撩云式 0.30s）条内放不下名字，就贴到条的右侧写
+        // 名字要写在条内：轴段短（如绝学 0.30s）时先逐档缩字号去凑条宽，
+        // 还差一点就把字形横向压扁（下限 0.7，再扁就不成形了）；
+        // 只有在条窄到怎么都放不下时，才退到条的右侧外——那是最后的兜底，不该是常态
         const label = act.name || '';
-        const lw = measure(ctx, label, 10, 700);
         const tcol = performing ? '#ffffff' : 'rgba(240,230,208,0.9)';
-        if (cr - cl >= lw + 8) {
-          text(ctx, label, cl + 4, myBarY + barH / 2, {
-            size: 10, weight: 700, baseline: 'middle', color: tcol,
+        const avail = cr - cl - 5;
+        let size = 10;
+        while (size > 8 && measure(ctx, label, size, 700) > avail) size -= 0.5;
+        const lw = measure(ctx, label, size, 700);
+        if (lw <= avail) {
+          text(ctx, label, (cl + cr) / 2, myBarY + barH / 2, {
+            size, weight: 700, align: 'center', baseline: 'middle', color: tcol,
           });
+        } else if (avail / lw >= 0.7) {
+          ctx.save();
+          ctx.translate((cl + cr) / 2, myBarY + barH / 2);
+          ctx.scale(avail / lw, 1);
+          text(ctx, label, 0, 0, {
+            size, weight: 700, align: 'center', baseline: 'middle', color: tcol,
+          });
+          ctx.restore();
         } else if (cr + 4 + lw <= trackR) {
           text(ctx, label, cr + 4, myBarY + barH / 2, {
             size: 10, weight: 700, baseline: 'middle', color: tcol,

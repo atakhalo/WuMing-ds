@@ -203,6 +203,7 @@ export const INTENT = {
 };
 
 // 绝学：U 键释放，需剑意满，释放后剑意清零。伤害随剑意上限与攻击倍率走
+// 轴段与闪避同长（引用 EVADE.axis）：放完立刻回到读轴，不会因为一剑挥空而长时间脱不出手
 export const ULTIMATE = {
   id: 'wuming',
   name: '无明剑意',
@@ -210,7 +211,7 @@ export const ULTIMATE = {
   dmgPerIntent: 1.35,
   tint: '#c9a6ff',
   perform: 0.75,
-  cd: 1.10,
+  cd: EVADE.axis,
   delay: 0.50,
   reach: 160,
   desc: '剑意盈满，凝于一剑。每点剑意化为锋芒，出剑后剑意归零。',
